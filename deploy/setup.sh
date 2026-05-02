@@ -49,6 +49,14 @@ sudo -u "$USER_NAME" bash -c "
   pip install -r requirements.txt
 "
 
+echo "==> Download icons + build icon index (fetches from schaledb.com)"
+sudo -u "$USER_NAME" bash -c "
+  set -e
+  cd '$SVC_DIR'
+  source .venv/bin/activate
+  python download_icons.py
+"
+
 echo "==> Build CLIP embeddings (downloads ~600 MB on first run, ~5 min each)"
 sudo -u "$USER_NAME" bash -c "
   set -e

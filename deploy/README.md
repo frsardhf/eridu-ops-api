@@ -47,10 +47,10 @@ sudo -u eridu bash -c "cd /opt/eridu-ops-api/services/inventory_parser && source
 systemctl restart eridu-parser
 ```
 
-If icon/embedding logic changed:
+If new game items were added (re-fetch icons + rebuild embeddings):
 
 ```bash
-sudo -u eridu bash -c "cd /opt/eridu-ops-api/services/inventory_parser && source .venv/bin/activate && python embed.py items && python embed.py equipment"
+sudo -u eridu bash -c "cd /opt/eridu-ops-api/services/inventory_parser && source .venv/bin/activate && python download_icons.py && python embed.py items && python embed.py equipment"
 systemctl restart eridu-parser
 ```
 

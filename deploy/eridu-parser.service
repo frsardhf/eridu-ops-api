@@ -10,7 +10,7 @@ WorkingDirectory=/opt/eridu-ops-api/services/inventory_parser
 Environment=PATH=/opt/eridu-ops-api/services/inventory_parser/.venv/bin
 ExecStart=/opt/eridu-ops-api/services/inventory_parser/.venv/bin/gunicorn \
     --bind 127.0.0.1:5001 \
-    --workers 3 \
+    --workers 1 \
     --preload \
     --timeout 120 \
     app:app

@@ -11,10 +11,7 @@ Environment=PATH=/opt/eridu-ops-api/services/inventory_parser/.venv/bin
 Environment=OMP_NUM_THREADS=4
 Environment=MKL_NUM_THREADS=4
 ExecStart=/opt/eridu-ops-api/services/inventory_parser/.venv/bin/gunicorn \
-    --bind 127.0.0.1:5001 \
-    --workers 1 \
-    --preload \
-    --timeout 300 \
+    --config /opt/eridu-ops-api/services/inventory_parser/gunicorn.conf.py \
     app:app
 Restart=always
 RestartSec=5

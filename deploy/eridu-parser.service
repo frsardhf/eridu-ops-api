@@ -1,0 +1,21 @@
+[Unit]
+Description=Eridu Inventory Parser
+After=network.target
+
+[Service]
+Type=simple
+User=eridu
+Group=eridu
+WorkingDirectory=/opt/eridu-ops-api/services/inventory_parser
+Environment=PATH=/opt/eridu-ops-api/services/inventory_parser/.venv/bin
+ExecStart=/opt/eridu-ops-api/services/inventory_parser/.venv/bin/gunicorn \
+    --bind 127.0.0.1:5001 \
+    --workers 3 \
+    --preload \
+    --timeout 120 \
+    app:app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

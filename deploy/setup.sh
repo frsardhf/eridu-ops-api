@@ -25,12 +25,13 @@ fi
 
 echo "==> System packages"
 apt update
-apt install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx git ufw curl
+apt install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx git ufw curl libgl1
 
 echo "==> Service user"
 id "$USER_NAME" &>/dev/null || useradd -m -s /bin/bash "$USER_NAME"
 
 echo "==> Clone / update repo"
+git config --global --add safe.directory "$APP_DIR" 2>/dev/null || true
 if [ -d "$APP_DIR/.git" ]; then
   git -C "$APP_DIR" pull
 else

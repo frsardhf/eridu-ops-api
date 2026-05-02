@@ -1,2 +1,4 @@
 *
 !.gitignore
+!icon_index_items.json
+!icon_index_equipment.json

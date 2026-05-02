@@ -1,0 +1,8 @@
+flask
+flask-cors
+gunicorn
+opencv-python
+numpy
+torch
+transformers
+easyocr

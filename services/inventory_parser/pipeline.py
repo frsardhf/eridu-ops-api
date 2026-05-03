@@ -20,10 +20,15 @@ SCHALEDB_BASE_URL = 'https://schaledb.com/data/en'
 GRID_FALLBACK_LEFT_RATIO = 0.06
 GRID_FALLBACK_RIGHT_RATIO = 0.95
 # Top: just below the "List / filter" header bar (~22% of right-half height)
-# Bottom: just above the "Item cannot be used here" footer bar (~78%)
+# Bottom (items): just above the "Item cannot be used here" footer bar (~78%)
+# Bottom (equipment): no footer bar — grid runs to ~92% of right-half height.
+#   Derivation: 4-row items has cell_h≈151px (grid top=237, bottom=842 on 1080px).
+#   5 rows × 151px = 755px → correct bottom = 237+755 = 992 → ratio ≈ 0.919 → 0.92.
+#   Using 0.95 inflates cell_h to ~158px, shifting row boundaries and dropping CLIP scores.
 # Providing list_header.png + item_cannot_use.png templates overrides these.
 GRID_FALLBACK_TOP_RATIO = 0.22
 GRID_FALLBACK_BOTTOM_RATIO = 0.78
+GRID_FALLBACK_BOTTOM_RATIO_EQUIPMENT = 0.92
 GRID_ANCHOR_MARGIN = 5
 
 # CLIP model used for icon embedding.
@@ -499,7 +504,10 @@ def _find_panel_bounds(image: np.ndarray) -> Optional[Tuple[int, int, int, int]]
     return x, y, w, h
 
 
-def _compute_grid_bounds(right_half: np.ndarray) -> Tuple[int, int, int, int]:
+def _compute_grid_bounds(
+    right_half: np.ndarray,
+    inventory_type: str = 'items',
+) -> Tuple[int, int, int, int]:
     height, width = right_half.shape[:2]
 
     list_header_path = os.path.join(ASSETS_DIR, 'list_header.png')
@@ -508,8 +516,13 @@ def _compute_grid_bounds(right_half: np.ndarray) -> Tuple[int, int, int, int]:
     list_match = _match_template(right_half, list_header_path)
     cannot_match = _match_template(right_half, item_cannot_path)
 
+    # Equipment has no "Item cannot be used here" footer, so the grid extends
+    # further down.  Use a taller fallback bottom ratio for equipment.
+    bottom_ratio = (GRID_FALLBACK_BOTTOM_RATIO_EQUIPMENT
+                    if inventory_type == 'equipment'
+                    else GRID_FALLBACK_BOTTOM_RATIO)
     top = int(height * GRID_FALLBACK_TOP_RATIO)
-    bottom = int(height * GRID_FALLBACK_BOTTOM_RATIO)
+    bottom = int(height * bottom_ratio)
 
     if list_match:
         _, y, _, h = list_match
@@ -1419,14 +1432,17 @@ def parse_inventory(image_bytes: bytes, inventory_type: str) -> List[Dict]:
     height, width = image.shape[:2]
     right_half = image[:, width // 2 :]
 
-    left, top, right, bottom = _compute_grid_bounds(right_half)
+    left, top, right, bottom = _compute_grid_bounds(right_half, inventory_type)
     if right <= left or bottom <= top:
         return []
 
     grid = right_half[top:bottom, left:right]
     grid_h, grid_w = grid.shape[:2]
 
-    rows = 4
+    # Equipment screenshots show 5 rows; items show 4.
+    # _compute_grid_bounds uses a taller fallback bottom ratio for equipment
+    # (0.95 vs 0.78) so the grid height already covers the full 5-row area.
+    rows = 5 if inventory_type == 'equipment' else 4
     cols = 5
     cell_w = grid_w / cols
 

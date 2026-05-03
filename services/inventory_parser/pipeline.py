@@ -412,6 +412,7 @@ def _read_quantity(roi_bgr: np.ndarray) -> Tuple[int, float]:
         return (is_bottom, has_x, n_digits, float(result[2]))
 
     best = max(results, key=_qty_priority)
+    _bbox_x_min = min(pt[0] for pt in best[0])
     text: str = best[1].upper()
     conf: float = float(best[2])
 
@@ -421,13 +422,35 @@ def _read_quantity(roi_bgr: np.ndarray) -> Tuple[int, float]:
     # If × appears within the first 3 characters, drop everything up to and
     # including it; otherwise fall back to stripping leading X/× as before.
     m = re.match(r'^.{0,2}[X×]', text)
-    text = text[m.end():] if m else re.sub(r'^[X×]+', '', text)
+    if m:
+        text = text[m.end():]
+        _x_stripped = True
+    else:
+        _stripped = re.sub(r'^[X×]+', '', text)
+        _x_stripped = _stripped != text
+        text = _stripped
+    # Additional fix: × is sometimes misread as '7' at the left edge of the crop
+    # (the diagonal strokes of × resemble the numeral).  Detectable when: no X
+    # character appeared in the text, the text starts with '7', the bounding box
+    # starts very close to x=0 (where × always sits), and removing the spurious
+    # leading '7' still leaves ≥ 3 digits.  The 30 px threshold applies to the
+    # 3× up-scaled crop (≈ 10 px in the original ROI).
+    if not _x_stripped and text.startswith('7') and len(text) >= 4 and _bbox_x_min < 30:
+        text = text[1:]
 
     # Parse optional K/M suffix.
     multiplier = 1
     if text.endswith('M'):
-        multiplier = 1_000_000
-        text = text[:-1]
+        _before_m = text[:-1]
+        if len(_before_m) == 1 and _before_m.isdigit():
+            # Single digit before 'M': EasyOCR almost certainly misread a trailing
+            # '7' as 'M' (the two glyphs share a wide top stroke in the game font).
+            # e.g. raw "X9M" → stripped "9M" → actual ×97.
+            # Real ×NM quantities (millions) would show 2+ digits before the suffix.
+            text = _before_m + '7'
+        else:
+            multiplier = 1_000_000
+            text = text[:-1]
     elif text.endswith('K'):
         multiplier = 1_000
         text = text[:-1]
@@ -1446,5 +1469,9 @@ def parse_inventory(image_bytes: bytes, inventory_type: str) -> List[Dict]:
     _enforce_group_sort_order(
         results, icon_crops, recovered_crops, net, embeddings, labels,
     )
+
+    # _recover_favor_items appends recovered cells at the end of the list.
+    # Re-sort into row-major order so the frontend can use index-based layout.
+    results.sort(key=lambda r: r['row'] * 5 + r['col'])
 
     return results

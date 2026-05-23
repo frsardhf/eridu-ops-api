@@ -56,12 +56,6 @@ ICON_CROP_BOT   = 0.78   # bottom of icon (above quantity text)
 ICON_CROP_LEFT  = 0.28   # skip left (parallelogram triangle dead zone)
 ICON_CROP_RIGHT = 0.96   # right edge of icon
 
-# Quantity crop fractions — relative to cell height/width.
-QTY_CROP_TOP_FRAC   = 0.74   # start of quantity region (fraction of cell height from cell top)
-QTY_CROP_OVERFLOW   = 0.06   # extend below cell bottom (fraction of cell height)
-QTY_CROP_LEFT_FRAC  = 0.40   # left edge of quantity region (fraction of cell width)
-QTY_CROP_RIGHT_FRAC = 0.98   # right edge of quantity region (fraction of cell width)
-
 # Confidence blend weights (icon CLIP score vs digit OCR score).
 _CONF_ICON_WEIGHT  = 0.7
 _CONF_DIGIT_WEIGHT = 0.3
@@ -105,8 +99,9 @@ _EMBED_CACHE: Dict[str, Tuple[object, np.ndarray, Dict[str, str]]] = {}
 _RARITY_CACHE: Dict[str, Dict[str, str]] = {}
 # {inventory_type: {str(row_index): {circularity, aspect_ratio}}}
 _SHAPE_CACHE: Dict[str, Dict[str, dict]] = {}
-# EasyOCR reader — loaded once on first quantity read.
-_EASYOCR_READER = None
+# Florence-2 model + processor — loaded once on first quantity read.
+_FLORENCE_MODEL     = None
+_FLORENCE_PROCESSOR = None
 
 
 def get_item_icon_url(icon: str, item_type: str, tier: Optional[int] = None) -> str:
@@ -332,144 +327,117 @@ def warm_icon_db() -> None:
         _load_embeddings(inv_type)
         _load_rarities(inv_type)
         _load_shapes(inv_type)
-    _get_or_load_easyocr()
+    _get_or_load_florence()
 
 
-def _get_or_load_easyocr() -> object:
-    """Load EasyOCR reader once and cache globally."""
-    global _EASYOCR_READER
-    if _EASYOCR_READER is None:
-        import easyocr
-        print('[inventory_parser] Loading EasyOCR reader (en)')
-        _EASYOCR_READER = easyocr.Reader(['en'], gpu=False, verbose=False)
-    return _EASYOCR_READER
+def _get_or_load_florence():
+    """Load Florence-2-base model and processor once, cache globally."""
+    global _FLORENCE_MODEL, _FLORENCE_PROCESSOR
+    if _FLORENCE_MODEL is None:
+        import torch
+        from transformers import AutoProcessor, AutoModelForCausalLM
+        print('[inventory_parser] Loading Florence-2 OCR model')
+        _FLORENCE_PROCESSOR = AutoProcessor.from_pretrained(
+            'microsoft/Florence-2-base',
+            trust_remote_code=True,
+            use_fast=False,  # fast processor changes image sizes unexpectedly
+        )
+        _FLORENCE_MODEL = AutoModelForCausalLM.from_pretrained(
+            'microsoft/Florence-2-base',
+            dtype=torch.float32,
+            trust_remote_code=True,
+        )
+        # transformers 5.x removed _tie_or_clone_weights; manually share tensors
+        # so that lm_head / embed_tokens use the loaded shared embedding weights.
+        lm = _FLORENCE_MODEL.language_model
+        shared_w = lm.model.shared.weight
+        lm.model.encoder.embed_tokens.weight = shared_w
+        lm.model.decoder.embed_tokens.weight = shared_w
+        lm.lm_head.weight = shared_w
+        _FLORENCE_MODEL = _FLORENCE_MODEL.eval()
+    return _FLORENCE_MODEL, _FLORENCE_PROCESSOR
 
 
-# Upscale factor applied to quantity crop before OCR.
-# 3× is a sweet spot: fast enough for 20-cell grids, accurate on the game font.
-# Avoid 4× — it causes EasyOCR to merge narrow digits like '1' into neighbours.
-_QTY_OCR_SCALE = 3
+def _read_quantity(slot_bgr: np.ndarray) -> Tuple[int, float]:
+    """Read the quantity value from a full item-slot cell image.
 
+    Passes the whole cell to Florence-2-base (<OCR> task).  The model reads
+    all visible text, e.g. "T8 ×1408".  We extract the quantity by finding
+    the first × and taking the digit run that follows it.
 
-def _read_quantity(roi_bgr: np.ndarray) -> Tuple[int, float]:
-    """Read the quantity value from an item slot's bottom-right crop using EasyOCR.
-
-    Expected text format: ×NNN[K|M] where:
-      - × is the multiplication prefix (stripped)
-      - NNN is 1–5 decimal digits
-      - K multiplies by 1 000; M multiplies by 1 000 000
+    Passing the full cell (rather than a narrow bottom strip) gives Florence-2
+    more context about the surrounding UI, which helps it correctly recognise
+    digit shapes that differ in the JP/KR game font.
 
     Returns (quantity, confidence) where confidence ∈ [0, 1].
     """
-    reader = _get_or_load_easyocr()
-    h, w = roi_bgr.shape[:2]
+    from PIL import Image
+
+    h, w = slot_bgr.shape[:2]
     if h == 0 or w == 0:
         return 0, 0.0
 
-    scaled = cv2.resize(
-        roi_bgr,
-        (w * _QTY_OCR_SCALE, h * _QTY_OCR_SCALE),
-        interpolation=cv2.INTER_CUBIC,
-    )
+    import torch
+    model, processor = _get_or_load_florence()
 
-    # Sharpen: enhance digit edge contrast to reduce 1 ↔ 7 confusion.
-    # Unsharp mask: sharpened = original * 1.8 - blurred * 0.8
-    _gray = cv2.cvtColor(scaled, cv2.COLOR_BGR2GRAY)
-    _blur = cv2.GaussianBlur(_gray, (0, 0), 1.5)
-    _sharp = cv2.addWeighted(_gray, 1.8, _blur, -0.8, 0)
-    scaled = cv2.cvtColor(_sharp, cv2.COLOR_GRAY2BGR)
+    pil_img = Image.fromarray(cv2.cvtColor(slot_bgr, cv2.COLOR_BGR2RGB))
+    inputs = processor(text='<OCR>', images=pil_img, return_tensors='pt')
+    with torch.no_grad():
+        # use_cache=False: transformers 5.x KV cache format (EncoderDecoderCache)
+        # is incompatible with Florence-2's decoder code; disabling avoids the issue.
+        # max_new_tokens=25: full-cell text can be up to ~20 chars ("T10 ×2047 …").
+        output_ids = model.generate(**inputs, max_new_tokens=25, do_sample=False, use_cache=False)
+    text: str = processor.decode(output_ids[0], skip_special_tokens=True).upper().strip()
 
-    # Restrict character set to digits + known suffix/prefix characters.
-    results = reader.readtext(
-        scaled,
-        allowlist='0123456789kKmMxX×',
-        detail=1,
-    )
-    if not results:
+    if not text:
         return 0, 0.0
 
-    # Pick the best quantity detection.  Pure max-confidence is unreliable:
-    # SSR rarity frames and complex icon backgrounds produce spurious reads that
-    # can outscore the real quantity text.
+    # ── Extract quantity from OCR output ──────────────────────────────────
+    # Full-cell output example: "T8 ×1408"
+    # Find the first × (or X used as ×) in the text, then take the digit run
+    # that immediately follows it.  X inside digit runs (e.g. "292X" where X
+    # is a misread "5") is handled separately below.
     #
-    # Priority (highest to lowest):
-    #   1. Vertical position — prefer detections at the BOTTOM of the crop.
-    #      When the grid is scroll-misaligned, quantity text from the row above
-    #      bleeds into the top of the current cell.  The actual quantity is always
-    #      at the bottom.  We discretise into top-half (0) vs bottom-half (1).
-    #   2. Starts with × / X  — the game ALWAYS prefixes quantities with ×.
-    #   3. Digit count after stripping ×/K/M.
-    #   4. EasyOCR confidence as final tiebreaker.
-    img_h = scaled.shape[0]
-
-    def _qty_priority(result):
-        # result[0] = bounding box polygon, result[1] = text, result[2] = conf
-        bbox = result[0]
-        # Centre-Y of the bounding box (average of all y-coordinates)
-        cy = sum(pt[1] for pt in bbox) / len(bbox)
-        is_bottom = int(cy > img_h * 0.45)
-
-        text = result[1].upper()
-        has_x = int(bool(re.match(r'^[X×]', text)))
-        raw = re.sub(r'^[X×]+', '', text)
-        raw = re.sub(r'[KM]$', '', raw)
-        n_digits = sum(c.isdigit() for c in raw)
-        return (is_bottom, has_x, n_digits, float(result[2]))
-
-    best = max(results, key=_qty_priority)
-    _bbox_x_min = min(pt[0] for pt in best[0])
-    text: str = best[1].upper()
-    conf: float = float(best[2])
-
-    # Strip leading × / X prefix (the in-game quantity multiplier symbol).
-    # Also handles icon-bleed: a curved icon edge in the top-left of the crop
-    # is sometimes mis-read as a leading digit (e.g. "1x179", "3X575", "4X748").
-    # If × appears within the first 3 characters, drop everything up to and
-    # including it; otherwise fall back to stripping leading X/× as before.
-    m = re.match(r'^.{0,2}[X×]', text)
+    # Pattern: optional × prefix, then digits, then optional trailing X (="5"),
+    #          then optional K/M suffix.
+    m = re.search(r'[×X]([\dX]+[KkMm]?)', text)
     if m:
-        text = text[m.end():]
-        _x_stripped = True
+        qty_raw = m.group(1).upper()
     else:
-        _stripped = re.sub(r'^[X×]+', '', text)
-        _x_stripped = _stripped != text
-        text = _stripped
-    # Additional fix: × is sometimes misread as '7' at the left edge of the crop
-    # (the diagonal strokes of × resemble the numeral).  Detectable when: no X
-    # character appeared in the text, the text starts with '7', the bounding box
-    # starts very close to x=0 (where × always sits), and removing the spurious
-    # leading '7' still leaves ≥ 3 digits.  The 30 px threshold applies to the
-    # 3× up-scaled crop (≈ 10 px in the original ROI).
-    if not _x_stripped and text.startswith('7') and len(text) >= 4 and _bbox_x_min < 30:
-        text = text[1:]
+        # No × found — fall back to the last digit group in the text.
+        groups = re.findall(r'\d+[KkMm]?', text)
+        if not groups:
+            return 0, 0.3
+        qty_raw = groups[-1].upper()
+
+    # Trailing 'X' after a digit → the digit '5' was misread as × (JP font).
+    if qty_raw.endswith('X') and len(qty_raw) >= 2 and qty_raw[-2].isdigit():
+        qty_raw = qty_raw[:-1] + '5'
 
     # Parse optional K/M suffix.
     multiplier = 1
-    if text.endswith('M'):
-        _before_m = text[:-1]
-        if len(_before_m) == 1 and _before_m.isdigit():
-            # Single digit before 'M': EasyOCR almost certainly misread a trailing
-            # '7' as 'M' (the two glyphs share a wide top stroke in the game font).
-            # e.g. raw "X9M" → stripped "9M" → actual ×97.
-            # Real ×NM quantities (millions) would show 2+ digits before the suffix.
-            text = _before_m + '7'
+    if qty_raw.endswith('M'):
+        before_m = qty_raw[:-1]
+        if len(before_m) == 1 and before_m.isdigit():
+            # Single digit + M → the trailing '7' was misread as 'M'.
+            qty_raw = before_m + '7'
         else:
             multiplier = 1_000_000
-            text = text[:-1]
-    elif text.endswith('K'):
+            qty_raw = before_m
+    elif qty_raw.endswith('K'):
         multiplier = 1_000
-        text = text[:-1]
+        qty_raw = qty_raw[:-1]
 
-    digits = re.sub(r'[^0-9]', '', text)
+    digits = re.sub(r'[^0-9]', '', qty_raw)
     if not digits:
-        return 0, conf
+        return 0, 0.3
 
     try:
         quantity = int(digits) * multiplier
     except ValueError:
-        quantity = 0
+        return 0, 0.3
 
-    return quantity, conf
+    return quantity, 0.9
 
 
 def _match_template(image: np.ndarray, template_path: str, threshold: float = 0.7) -> Optional[Tuple[int, int, int, int]]:
@@ -1066,17 +1034,6 @@ def _extract_icon_crop(slot: np.ndarray) -> np.ndarray:
     ]
 
 
-def _extract_quantity_crop(
-    grid: np.ndarray, y0: int, y1: int, x0: int, sh: int, sw: int,
-) -> np.ndarray:
-    """Crop the quantity-text region from the grid (may extend below cell)."""
-    qty_top   = y0 + int(sh * QTY_CROP_TOP_FRAC)
-    qty_bot   = min(y1 + int(sh * QTY_CROP_OVERFLOW), grid.shape[0])
-    qty_left  = x0 + int(sw * QTY_CROP_LEFT_FRAC)
-    qty_right = min(x0 + int(sw * QTY_CROP_RIGHT_FRAC), grid.shape[1])
-    return grid[qty_top:qty_bot, qty_left:qty_right]
-
-
 def _compute_confidence(icon_score: float, digit_score: float) -> float:
     """Blend icon and digit scores into a clamped confidence value."""
     return max(0.0, min(1.0,
@@ -1148,10 +1105,9 @@ def _process_grid_cells(
 
             icon_score = best_score
 
-            # Quantity crop — taken from the GRID (not the slot) so it can
-            # overflow the cell boundary by a few pixels.
-            quantity_crop = _extract_quantity_crop(grid, y0, y1, x0, sh, sw)
-            quantity, digit_score = _read_quantity(quantity_crop)
+            # Pass the full slot to OCR — Florence-2 benefits from seeing the
+            # tier label + icon context alongside the quantity text.
+            quantity, digit_score = _read_quantity(slot)
 
             confidence = _compute_confidence(icon_score, digit_score)
 
@@ -1255,8 +1211,7 @@ def _recover_favor_items(
                     existing['itemId'] = new_id
                     existing['rarity'] = new_rar
                 else:
-                    quantity_crop = _extract_quantity_crop(grid, y0, y1, x0, sh, sw)
-                    quantity, digit_score = _read_quantity(quantity_crop)
+                    quantity, digit_score = _read_quantity(slot)
                     confidence = _compute_confidence(best_score, digit_score)
 
                     results.append({
@@ -1304,8 +1259,7 @@ def _recover_favor_items(
                 recovered_crops[(row, col)] = icon_crop
                 rec_id = labels[str(best_idx)]
                 rec_rar = rarities.get(str(best_idx), 'N')
-                quantity_crop = _extract_quantity_crop(grid, y0, y1, x0, sh, sw)
-                quantity, digit_score = _read_quantity(quantity_crop)
+                quantity, digit_score = _read_quantity(slot)
                 confidence = _compute_confidence(best_score, digit_score)
                 results.append({
                     'row': row,

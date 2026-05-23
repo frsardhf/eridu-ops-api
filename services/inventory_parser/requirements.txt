@@ -3,6 +3,12 @@ flask-cors
 gunicorn
 opencv-python-headless
 numpy
+scipy
 torch
-transformers
-easyocr
+# Florence-2 (microsoft/Florence-2-base) requires transformers >=4.38, <5.0.
+# transformers 5.x removed _tie_or_clone_weights and changed KV-cache format
+# in ways that break Florence-2's custom modeling code.
+transformers>=4.38.0,<5.0
+timm
+einops
+Pillow

@@ -349,9 +349,11 @@ def _get_or_load_florence():
             trust_remote_code=True,
             **_proc_kwargs,
         )
+        # transformers 4.x uses `dtype`, 5.x renamed it to `torch_dtype`
+        _dtype_kwarg = 'torch_dtype' if _tf_major >= 5 else 'dtype'
         _FLORENCE_MODEL = AutoModelForCausalLM.from_pretrained(
             'microsoft/Florence-2-base',
-            torch_dtype=torch.float32,
+            **{_dtype_kwarg: torch.float32},
             trust_remote_code=True,
             attn_implementation='eager',  # bypass SDPA dispatch; Florence-2 doesn't declare _supports_sdpa
         )

@@ -365,6 +365,7 @@ def _get_or_load_florence():
         lm.model.decoder.embed_tokens.weight = shared_w
         lm.lm_head.weight = shared_w
         _FLORENCE_MODEL = _FLORENCE_MODEL.eval()
+        print('[inventory_parser] Florence-2 ready')
     return _FLORENCE_MODEL, _FLORENCE_PROCESSOR
 
 

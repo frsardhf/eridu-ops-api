@@ -368,53 +368,19 @@ def _get_or_load_florence():
     return _FLORENCE_MODEL, _FLORENCE_PROCESSOR
 
 
-def _read_quantity(slot_bgr: np.ndarray) -> Tuple[int, float]:
-    """Read the quantity value from a full item-slot cell image.
+def _parse_quantity_from_text(text: str) -> Tuple[int, float]:
+    """Parse a quantity integer from Florence-2 OCR output text.
 
-    Passes the whole cell to Florence-2-base (<OCR> task).  The model reads
-    all visible text, e.g. "T8 ×1408".  We extract the quantity by finding
-    the first × and taking the digit run that follows it.
-
-    Passing the full cell (rather than a narrow bottom strip) gives Florence-2
-    more context about the surrounding UI, which helps it correctly recognise
-    digit shapes that differ in the JP/KR game font.
-
-    Returns (quantity, confidence) where confidence ∈ [0, 1].
+    Full-cell output example: "T8 ×1408" → 1408.
+    Returns (quantity, confidence).
     """
-    from PIL import Image
-
-    h, w = slot_bgr.shape[:2]
-    if h == 0 or w == 0:
-        return 0, 0.0
-
-    import torch
-    model, processor = _get_or_load_florence()
-
-    pil_img = Image.fromarray(cv2.cvtColor(slot_bgr, cv2.COLOR_BGR2RGB))
-    inputs = processor(text='<OCR>', images=pil_img, return_tensors='pt')
-    with torch.no_grad():
-        # use_cache=False: transformers 5.x KV cache format (EncoderDecoderCache)
-        # is incompatible with Florence-2's decoder code; disabling avoids the issue.
-        # max_new_tokens=25: full-cell text can be up to ~20 chars ("T10 ×2047 …").
-        output_ids = model.generate(**inputs, max_new_tokens=25, do_sample=False, use_cache=False)
-    text: str = processor.decode(output_ids[0], skip_special_tokens=True).upper().strip()
-
     if not text:
         return 0, 0.0
 
-    # ── Extract quantity from OCR output ──────────────────────────────────
-    # Full-cell output example: "T8 ×1408"
-    # Find the first × (or X used as ×) in the text, then take the digit run
-    # that immediately follows it.  X inside digit runs (e.g. "292X" where X
-    # is a misread "5") is handled separately below.
-    #
-    # Pattern: optional × prefix, then digits, then optional trailing X (="5"),
-    #          then optional K/M suffix.
     m = re.search(r'[×X]([\dX]+[KkMm]?)', text)
     if m:
         qty_raw = m.group(1).upper()
     else:
-        # No × found — fall back to the last digit group in the text.
         groups = re.findall(r'\d+[KkMm]?', text)
         if not groups:
             return 0, 0.3
@@ -424,12 +390,10 @@ def _read_quantity(slot_bgr: np.ndarray) -> Tuple[int, float]:
     if qty_raw.endswith('X') and len(qty_raw) >= 2 and qty_raw[-2].isdigit():
         qty_raw = qty_raw[:-1] + '5'
 
-    # Parse optional K/M suffix.
     multiplier = 1
     if qty_raw.endswith('M'):
         before_m = qty_raw[:-1]
         if len(before_m) == 1 and before_m.isdigit():
-            # Single digit + M → the trailing '7' was misread as 'M'.
             qty_raw = before_m + '7'
         else:
             multiplier = 1_000_000
@@ -443,11 +407,66 @@ def _read_quantity(slot_bgr: np.ndarray) -> Tuple[int, float]:
         return 0, 0.3
 
     try:
-        quantity = int(digits) * multiplier
+        return int(digits) * multiplier, 0.9
     except ValueError:
         return 0, 0.3
 
-    return quantity, 0.9
+
+def _read_quantities_batch(slots_bgr: List[np.ndarray]) -> List[Tuple[int, float]]:
+    """Run Florence-2 OCR on a batch of slot images in one forward pass.
+
+    Batching all cells together is ~N× faster than N sequential calls on CPU
+    because the encoder runs once across the batch and the decoder steps run
+    in parallel across batch items.
+    """
+    from PIL import Image
+    import torch
+    import transformers as _tf
+
+    if not slots_bgr:
+        return []
+
+    model, processor = _get_or_load_florence()
+    _tf_major = int(_tf.__version__.split('.')[0])
+
+    pil_imgs = [
+        Image.fromarray(cv2.cvtColor(s, cv2.COLOR_BGR2RGB))
+        for s in slots_bgr
+    ]
+    n = len(pil_imgs)
+
+    inputs = processor(
+        text=['<OCR>'] * n,
+        images=pil_imgs,
+        return_tensors='pt',
+        padding=True,
+    )
+    with torch.no_grad():
+        # use_cache=False needed on transformers 5.x: EncoderDecoderCache format
+        # is incompatible with Florence-2's decoder tuple indexing.
+        # On transformers 4.x the old tuple cache works fine — keep it enabled
+        # for faster decoding.
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=20,
+            do_sample=False,
+            use_cache=(_tf_major < 5),
+        )
+
+    return [
+        _parse_quantity_from_text(
+            processor.decode(output_ids[i], skip_special_tokens=True).upper().strip()
+        )
+        for i in range(n)
+    ]
+
+
+def _read_quantity(slot_bgr: np.ndarray) -> Tuple[int, float]:
+    """Read quantity from a single slot image (thin wrapper around batch version)."""
+    h, w = slot_bgr.shape[:2]
+    if h == 0 or w == 0:
+        return 0, 0.0
+    return _read_quantities_batch([slot_bgr])[0]
 
 
 def _match_template(image: np.ndarray, template_path: str, threshold: float = 0.7) -> Optional[Tuple[int, int, int, int]]:
@@ -1082,9 +1101,16 @@ def _process_grid_cells(
     rarities: Dict[str, str],
     shapes: Optional[Dict[str, str]],
 ) -> Tuple[List[Dict], List[np.ndarray]]:
-    """Classify every grid cell and return (results, icon_crops)."""
-    results: List[Dict] = []
-    icon_crops: List[np.ndarray] = []
+    """Classify every grid cell and return (results, icon_crops).
+
+    Two-pass design:
+      Pass 1 — CLIP icon matching for every cell (fast, CPU-bound numpy).
+      Pass 2 — Florence-2 OCR on all valid slots in one batched forward pass
+               (~N× faster than N sequential generate() calls on CPU).
+    """
+    # ── Pass 1: CLIP matching ─────────────────────────────────────────────
+    candidates: List[Tuple[int, int, np.ndarray, np.ndarray, str, str, float]] = []
+    # each entry: (row, col, slot, icon_crop, rarity, best_id, icon_score)
 
     for row in range(rows):
         for col in range(cols):
@@ -1098,9 +1124,6 @@ def _process_grid_cells(
                 continue
 
             rarity, _ = _classify_rarity(slot)
-
-            sh, sw = slot.shape[:2]
-
             icon_crop = _extract_icon_crop(slot)
             if icon_crop.size == 0:
                 continue
@@ -1113,23 +1136,31 @@ def _process_grid_cells(
             if best_id is None or best_score < EMBED_SCORE_THRESHOLD:
                 continue
 
-            icon_score = best_score
+            candidates.append((row, col, slot, icon_crop, rarity, best_id, best_score))
 
-            # Pass the full slot to OCR — Florence-2 benefits from seeing the
-            # tier label + icon context alongside the quantity text.
-            quantity, digit_score = _read_quantity(slot)
+    if not candidates:
+        return [], []
 
-            confidence = _compute_confidence(icon_score, digit_score)
+    # ── Pass 2: batch Florence-2 OCR on all valid slots ───────────────────
+    slots = [c[2] for c in candidates]
+    quantities = _read_quantities_batch(slots)
 
-            results.append({
-                'row': row,
-                'col': col,
-                'itemId': best_id,
-                'rarity': rarity,
-                'quantity': int(quantity),
-                'confidence': round(confidence, 4)
-            })
-            icon_crops.append(icon_crop)
+    # ── Assemble results ──────────────────────────────────────────────────
+    results: List[Dict] = []
+    icon_crops: List[np.ndarray] = []
+
+    for i, (row, col, slot, icon_crop, rarity, best_id, icon_score) in enumerate(candidates):
+        quantity, digit_score = quantities[i]
+        confidence = _compute_confidence(icon_score, digit_score)
+        results.append({
+            'row': row,
+            'col': col,
+            'itemId': best_id,
+            'rarity': rarity,
+            'quantity': int(quantity),
+            'confidence': round(confidence, 4),
+        })
+        icon_crops.append(icon_crop)
 
     return results, icon_crops
 

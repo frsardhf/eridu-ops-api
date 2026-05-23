@@ -337,10 +337,17 @@ def _get_or_load_florence():
         import torch
         from transformers import AutoProcessor, AutoModelForCausalLM
         print('[inventory_parser] Loading Florence-2 OCR model')
+        import transformers as _tf
+        _tf_major = int(_tf.__version__.split('.')[0])
+        # transformers 5.x introduced a fast CLIPImageProcessor that changes image
+        # sizes and breaks Florence-2's square-feature-map assertion — disable it.
+        # transformers 4.x has no fast image processor; use_fast=False there forces
+        # the slow BART tokenizer which needs merges.txt (not shipped by Florence-2).
+        _proc_kwargs = {'use_fast': False} if _tf_major >= 5 else {}
         _FLORENCE_PROCESSOR = AutoProcessor.from_pretrained(
             'microsoft/Florence-2-base',
             trust_remote_code=True,
-            use_fast=False,  # fast processor changes image sizes unexpectedly
+            **_proc_kwargs,
         )
         _FLORENCE_MODEL = AutoModelForCausalLM.from_pretrained(
             'microsoft/Florence-2-base',

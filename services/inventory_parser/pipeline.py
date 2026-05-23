@@ -344,8 +344,9 @@ def _get_or_load_florence():
         )
         _FLORENCE_MODEL = AutoModelForCausalLM.from_pretrained(
             'microsoft/Florence-2-base',
-            dtype=torch.float32,
+            torch_dtype=torch.float32,
             trust_remote_code=True,
+            attn_implementation='eager',  # bypass SDPA dispatch; Florence-2 doesn't declare _supports_sdpa
         )
         # transformers 5.x removed _tie_or_clone_weights; manually share tensors
         # so that lm_head / embed_tokens use the loaded shared embedding weights.

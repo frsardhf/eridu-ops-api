@@ -77,7 +77,7 @@ import torch
 print('Downloading Florence-2 processor...')
 AutoProcessor.from_pretrained('microsoft/Florence-2-base', trust_remote_code=True)
 print('Downloading Florence-2 model...')
-AutoModelForCausalLM.from_pretrained('microsoft/Florence-2-base', dtype=torch.float32, trust_remote_code=True)
+AutoModelForCausalLM.from_pretrained('microsoft/Florence-2-base', torch_dtype=torch.float32, trust_remote_code=True, attn_implementation='eager')
 print('Florence-2 ready.')
 \"
 "

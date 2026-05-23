@@ -10,7 +10,9 @@ CORS(app, origins=['https://eriduops.com', 'http://localhost:5173'])
 try:
     warm_icon_db()
 except Exception as exc:
+    import traceback
     print(f'[inventory_parser] Warmup failed: {exc}')
+    traceback.print_exc()
 
 
 @app.post('/inventory/parse')

@@ -450,6 +450,8 @@ def _read_quantities_batch(slots_bgr: List[np.ndarray]) -> List[Tuple[int, float
             **inputs,
             max_new_tokens=20,
             do_sample=False,
+            num_beams=1,       # greedy — beam search crashes on batch>1 with Florence-2 cache;
+                               # also ~3× faster than the default num_beams=3
             use_cache=(_tf_major < 5),
         )
 

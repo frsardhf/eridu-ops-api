@@ -450,9 +450,10 @@ def _read_quantities_batch(slots_bgr: List[np.ndarray]) -> List[Tuple[int, float
             **inputs,
             max_new_tokens=20,
             do_sample=False,
-            num_beams=1,       # greedy — beam search crashes on batch>1 with Florence-2 cache;
-                               # also ~3× faster than the default num_beams=3
-            use_cache=(_tf_major < 5),
+            num_beams=1,    # greedy — Florence-2 defaults num_beams=3; forcing 1 is ~3× faster
+            use_cache=False,  # Florence-2's prepare_inputs_for_generation accesses
+                              # past_key_values[0][0] unconditionally; with cache enabled
+                              # the initial None entry crashes on any batch size.
         )
 
     return [
@@ -1110,9 +1111,8 @@ def _process_grid_cells(
       Pass 2 — Florence-2 OCR on all valid slots in one batched forward pass
                (~N× faster than N sequential generate() calls on CPU).
     """
-    # ── Pass 1: CLIP matching ─────────────────────────────────────────────
-    candidates: List[Tuple[int, int, np.ndarray, np.ndarray, str, str, float]] = []
-    # each entry: (row, col, slot, icon_crop, rarity, best_id, icon_score)
+    results: List[Dict] = []
+    icon_crops: List[np.ndarray] = []
 
     for row in range(rows):
         for col in range(cols):
@@ -1138,31 +1138,18 @@ def _process_grid_cells(
             if best_id is None or best_score < EMBED_SCORE_THRESHOLD:
                 continue
 
-            candidates.append((row, col, slot, icon_crop, rarity, best_id, best_score))
+            quantity, digit_score = _read_quantity(slot)
+            confidence = _compute_confidence(best_score, digit_score)
 
-    if not candidates:
-        return [], []
-
-    # ── Pass 2: batch Florence-2 OCR on all valid slots ───────────────────
-    slots = [c[2] for c in candidates]
-    quantities = _read_quantities_batch(slots)
-
-    # ── Assemble results ──────────────────────────────────────────────────
-    results: List[Dict] = []
-    icon_crops: List[np.ndarray] = []
-
-    for i, (row, col, slot, icon_crop, rarity, best_id, icon_score) in enumerate(candidates):
-        quantity, digit_score = quantities[i]
-        confidence = _compute_confidence(icon_score, digit_score)
-        results.append({
-            'row': row,
-            'col': col,
-            'itemId': best_id,
-            'rarity': rarity,
-            'quantity': int(quantity),
-            'confidence': round(confidence, 4),
-        })
-        icon_crops.append(icon_crop)
+            results.append({
+                'row': row,
+                'col': col,
+                'itemId': best_id,
+                'rarity': rarity,
+                'quantity': int(quantity),
+                'confidence': round(confidence, 4),
+            })
+            icon_crops.append(icon_crop)
 
     return results, icon_crops
 

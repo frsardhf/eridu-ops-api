@@ -1,5 +1,12 @@
+import os
+
+from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+
+# Load .env from the repo root (two dirs up from this file).
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+load_dotenv(os.path.join(_REPO_ROOT, '.env'))
 
 from pipeline import parse_inventory, warm_icon_db
 

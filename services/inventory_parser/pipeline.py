@@ -473,6 +473,134 @@ def _read_quantity(slot_bgr: np.ndarray) -> Tuple[int, float]:
     return _read_quantities_batch([slot_bgr])[0]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Gemini Flash OCR — fast path (~6s/screenshot vs ~240s for Florence-2 on CPU)
+# Falls back to Florence-2 on rate-limit / error / missing key.
+# ─────────────────────────────────────────────────────────────────────────────
+from datetime import datetime, timezone as _tz
+
+_GEMINI_MODEL = 'gemini-2.5-flash'
+_GEMINI_DAILY_LIMIT = 1000   # conservative; free tier nominally allows ~1500/day
+_GEMINI_CLIENT = None
+_gemini_state = {'date': None, 'success': 0, 'adaptive_cap': _GEMINI_DAILY_LIMIT}
+
+
+def _get_gemini_client():
+    """Lazy-load the Gemini client. Returns None if no API key configured."""
+    global _GEMINI_CLIENT
+    if _GEMINI_CLIENT is None:
+        api_key = os.getenv('GEMINI_API_KEY')
+        if not api_key:
+            return None
+        try:
+            from google import genai
+            _GEMINI_CLIENT = genai.Client(api_key=api_key)
+            print(f'[inventory_parser] Gemini client ready ({_GEMINI_MODEL})')
+        except ImportError:
+            print('[inventory_parser] google-genai not installed — skipping Gemini')
+            return None
+    return _GEMINI_CLIENT
+
+
+def _under_gemini_cap() -> bool:
+    """True if we still have budget today. Resets at UTC midnight."""
+    today = datetime.now(_tz.utc).date()
+    if _gemini_state['date'] != today:
+        _gemini_state['date'] = today
+        _gemini_state['success'] = 0
+        _gemini_state['adaptive_cap'] = _GEMINI_DAILY_LIMIT
+    return _gemini_state['success'] < _gemini_state['adaptive_cap']
+
+
+def _record_gemini_quota_error(err: Exception) -> None:
+    """Drop the adaptive cap to current success count so we stop trying today."""
+    n = _gemini_state['success']
+    _gemini_state['adaptive_cap'] = n
+    print(f'[gemini] quota hit at {n} reqs today — cap lowered, falling back to Florence-2')
+    if n < 500:
+        print(f'[gemini] ALERT: cap dropped below 500 — Google may have lowered free tier ({err})')
+
+
+def _gemini_read_all_quantities(
+    grid_bgr: np.ndarray, rows: int, cols: int,
+) -> Optional[Dict[Tuple[int, int], int]]:
+    """One Gemini call to read every quantity in the grid.
+
+    Returns a dict mapping ``(row, col) -> quantity``, or ``None`` when
+    Gemini is unavailable (no key, daily cap hit, or runtime error). Callers
+    should fall back to Florence-2 per-cell OCR when this returns None.
+    """
+    if not _under_gemini_cap():
+        return None
+    client = _get_gemini_client()
+    if client is None:
+        return None
+
+    from PIL import Image
+
+    pil = Image.fromarray(cv2.cvtColor(grid_bgr, cv2.COLOR_BGR2RGB))
+    prompt = (
+        f"This is a Blue Archive game inventory grid with {rows} rows × {cols} "
+        f"columns of item cells. Each cell has an icon and a quantity number "
+        f"prefixed with '×' at the bottom-right.\n\n"
+        f"Read the quantity number for every cell, top-to-bottom, left-to-right. "
+        f"If a cell has no readable number, use 0. Return ONLY a JSON array, "
+        f"no markdown fences, no explanation:\n"
+        f'[{{"row":0,"col":0,"qty":1197}},{{"row":0,"col":1,"qty":607}},...]'
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=_GEMINI_MODEL,
+            contents=[pil, prompt],
+        )
+    except Exception as e:  # noqa: BLE001
+        err_str = str(e).lower()
+        if any(s in err_str for s in ('429', 'quota', 'resource_exhausted', 'rate')):
+            _record_gemini_quota_error(e)
+        else:
+            print(f'[gemini] error, falling back to Florence-2: {e}')
+        return None
+
+    text = (response.text or '').strip()
+    if text.startswith('```'):
+        text = re.sub(r'^```(?:json)?\s*', '', text)
+        text = re.sub(r'\s*```$', '', text)
+
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f'[gemini] non-JSON response, falling back: {e!r}; raw={text[:200]!r}')
+        return None
+
+    if not isinstance(parsed, list):
+        print(f'[gemini] expected list, got {type(parsed).__name__}; falling back')
+        return None
+
+    out: Dict[Tuple[int, int], int] = {}
+    for item in parsed:
+        try:
+            r = int(item['row']); c = int(item['col']); q = int(item['qty'])
+            out[(r, c)] = q
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    _gemini_state['success'] += 1
+    return out
+
+
+def _lookup_or_read_quantity(
+    slot_bgr: np.ndarray,
+    row: int,
+    col: int,
+    qty_lookup: Optional[Dict[Tuple[int, int], int]],
+) -> Tuple[int, float]:
+    """Prefer Gemini's cached lookup; fall back to per-cell Florence-2."""
+    if qty_lookup is not None and (row, col) in qty_lookup:
+        return qty_lookup[(row, col)], 0.95
+    return _read_quantity(slot_bgr)
+
+
 def _match_template(image: np.ndarray, template_path: str, threshold: float = 0.7) -> Optional[Tuple[int, int, int, int]]:
     if not os.path.exists(template_path):
         return None
@@ -1104,13 +1232,14 @@ def _process_grid_cells(
     labels: Dict[str, str],
     rarities: Dict[str, str],
     shapes: Optional[Dict[str, str]],
+    qty_lookup: Optional[Dict[Tuple[int, int], int]] = None,
 ) -> Tuple[List[Dict], List[np.ndarray]]:
     """Classify every grid cell and return (results, icon_crops).
 
     Two-pass design:
       Pass 1 — CLIP icon matching for every cell (fast, CPU-bound numpy).
-      Pass 2 — Florence-2 OCR on all valid slots in one batched forward pass
-               (~N× faster than N sequential generate() calls on CPU).
+      Pass 2 — Quantity OCR via *qty_lookup* if provided (Gemini batch),
+               otherwise per-cell Florence-2.
     """
     results: List[Dict] = []
     icon_crops: List[np.ndarray] = []
@@ -1139,7 +1268,7 @@ def _process_grid_cells(
             if best_id is None or best_score < EMBED_SCORE_THRESHOLD:
                 continue
 
-            quantity, digit_score = _read_quantity(slot)
+            quantity, digit_score = _lookup_or_read_quantity(slot, row, col, qty_lookup)
             confidence = _compute_confidence(best_score, digit_score)
 
             results.append({
@@ -1166,6 +1295,7 @@ def _recover_favor_items(
     embeddings: np.ndarray,
     labels: Dict[str, str],
     rarities: Dict[str, str],
+    qty_lookup: Optional[Dict[Tuple[int, int], int]] = None,
 ) -> Dict[tuple, np.ndarray]:
     """Recover dropped / mis-classified favor items via SSR detection passes.
 
@@ -1242,7 +1372,7 @@ def _recover_favor_items(
                     existing['itemId'] = new_id
                     existing['rarity'] = new_rar
                 else:
-                    quantity, digit_score = _read_quantity(slot)
+                    quantity, digit_score = _lookup_or_read_quantity(slot, row, col, qty_lookup)
                     confidence = _compute_confidence(best_score, digit_score)
 
                     results.append({
@@ -1290,7 +1420,7 @@ def _recover_favor_items(
                 recovered_crops[(row, col)] = icon_crop
                 rec_id = labels[str(best_idx)]
                 rec_rar = rarities.get(str(best_idx), 'N')
-                quantity, digit_score = _read_quantity(slot)
+                quantity, digit_score = _lookup_or_read_quantity(slot, row, col, qty_lookup)
                 confidence = _compute_confidence(best_score, digit_score)
                 results.append({
                     'row': row,
@@ -1451,9 +1581,18 @@ def parse_inventory(image_bytes: bytes, inventory_type: str) -> List[Dict]:
     rarities = _load_rarities(inventory_type)
     shapes   = _load_shapes(inventory_type)
 
+    # Try Gemini batch OCR once on the whole grid. On success we get a
+    # {(row, col): qty} lookup used by both _process_grid_cells and
+    # _recover_favor_items. On any failure (no key / quota / runtime error)
+    # this is None and both pass-throughs use per-cell Florence-2.
+    qty_lookup = _gemini_read_all_quantities(grid, rows, cols)
+    if qty_lookup is not None:
+        print(f'[inventory_parser] Gemini OCR ok ({len(qty_lookup)} cells)')
+
     results, icon_crops = _process_grid_cells(
         grid, rows, cols, cell_w, row_bounds,
         net, embeddings, labels, rarities, shapes,
+        qty_lookup=qty_lookup,
     )
 
     # Build id → rarity lookup from loaded embedding metadata and apply sort-order fix
@@ -1466,6 +1605,7 @@ def parse_inventory(image_bytes: bytes, inventory_type: str) -> List[Dict]:
     recovered_crops = _recover_favor_items(
         results, grid, rows, cols, cell_w, row_bounds,
         net, embeddings, labels, rarities,
+        qty_lookup=qty_lookup,
     )
     _enforce_group_sort_order(
         results, icon_crops, recovered_crops, net, embeddings, labels,

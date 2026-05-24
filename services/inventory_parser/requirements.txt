@@ -13,3 +13,7 @@ timm
 einops
 Pillow
 protobuf
+# Gemini Flash OCR — fast path; Florence-2 is the fallback when key is missing
+# or the daily free-tier quota is exhausted.
+google-genai
+python-dotenv

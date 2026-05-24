@@ -11,6 +11,9 @@ Environment=PATH=/opt/eridu-ops-api/services/inventory_parser/.venv/bin
 Environment=OMP_NUM_THREADS=4
 Environment=MKL_NUM_THREADS=4
 Environment=PYTHONUNBUFFERED=1
+# Optional .env at repo root for secrets (e.g. GEMINI_API_KEY).
+# Leading "-" makes systemd tolerate the file being absent.
+EnvironmentFile=-/opt/eridu-ops-api/.env
 ExecStart=/opt/eridu-ops-api/services/inventory_parser/.venv/bin/gunicorn \
     --config /opt/eridu-ops-api/services/inventory_parser/gunicorn.conf.py \
     app:app

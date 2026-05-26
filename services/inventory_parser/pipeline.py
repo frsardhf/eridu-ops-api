@@ -1580,6 +1580,73 @@ def _enforce_group_sort_order(
                 break
 
 
+# Tail-zone + sequence-break confidence demotion thresholds.
+# Cells flagged as suspect get their confidence bumped to _SUSPECT_CONF (0.3)
+# so the FE highlights them red for manual review. IDs are NOT changed —
+# this is purely a UX nudge for the cases CLIP/sort_order can't disambiguate
+# (Mode B: out-of-library item → closest visual match in library; Mode C:
+# tail-cell ambiguity between real high-ID items and misclassifications).
+_TAIL_ZONE_CELLS = 2          # last N grid positions get extra scrutiny
+_TAIL_CONF_THRESHOLD = 0.78   # tail cells below this are demoted
+_SUSPECT_CONF = 0.3           # red-zone confidence value applied to suspects
+
+
+def _demote_suspect_confidences(results: List[Dict], rows: int, cols: int) -> None:
+    """Mutate `results` in-place to demote confidence on cells that either
+    break monotonic sort order or sit in the high-risk tail zone with
+    mediocre confidence. Never changes itemId — only the confidence field.
+
+    Sequence-break check: a cell whose neighbours are mutually monotonic
+    but the cell itself violates that order is almost certainly wrong
+    (Mode B's signature pattern). The favor-boundary 5100 transition does
+    NOT trip this because the prev/next direction stays ascending.
+
+    Tail-zone check: the last 2 cells of the grid are statistically the
+    highest-error region (end-of-list ambiguity). Cells there with
+    confidence below 0.78 get demoted as a precaution.
+    """
+    if len(results) < 3:
+        return
+
+    ordered = sorted(results, key=lambda r: r['row'] * cols + r['col'])
+    ids = [int(r['itemId']) for r in ordered]
+    n = len(ordered)
+
+    asc = sum(1 for i in range(n - 1) if ids[i + 1] > ids[i])
+    desc = sum(1 for i in range(n - 1) if ids[i + 1] < ids[i])
+    ascending = asc >= desc
+
+    last_pos = (rows - 1) * cols + (cols - 1)
+    tail_threshold_pos = last_pos - _TAIL_ZONE_CELLS + 1
+
+    for i, r in enumerate(ordered):
+        suspect = False
+        grid_pos = r['row'] * cols + r['col']
+
+        # Interior sequence break: neighbours agree on direction but curr violates
+        if 0 < i < n - 1:
+            p, c, nx = ids[i - 1], ids[i], ids[i + 1]
+            if ascending and p < nx and not (p <= c <= nx):
+                suspect = True
+            elif (not ascending) and p > nx and not (p >= c >= nx):
+                suspect = True
+
+        # Last-cell direction violation (no next neighbour to triangulate)
+        if i == n - 1 and i > 0:
+            p, c = ids[i - 1], ids[i]
+            if ascending and c < p:
+                suspect = True
+            elif (not ascending) and c > p:
+                suspect = True
+
+        # Tail-zone strict: last N cells with mediocre confidence
+        if grid_pos >= tail_threshold_pos and r['confidence'] < _TAIL_CONF_THRESHOLD:
+            suspect = True
+
+        if suspect and r['confidence'] > _SUSPECT_CONF:
+            r['confidence'] = _SUSPECT_CONF
+
+
 def parse_inventory(image_bytes: bytes, inventory_type: str) -> List[Dict]:
     if inventory_type not in ('items', 'equipment'):
         return []
@@ -1661,6 +1728,11 @@ def parse_inventory(image_bytes: bytes, inventory_type: str) -> List[Dict]:
     _enforce_group_sort_order(
         results, icon_crops, recovered_crops, net, embeddings, labels,
     )
+
+    # Final UX pass: flag remaining suspect cells (Mode B out-of-library
+    # substitutions, Mode C tail-zone ambiguity) by demoting their confidence
+    # so the FE highlights them red. Does not touch itemId.
+    _demote_suspect_confidences(results, rows, cols)
 
     # _recover_favor_items appends recovered cells at the end of the list.
     # Re-sort into row-major order so the frontend can use index-based layout.

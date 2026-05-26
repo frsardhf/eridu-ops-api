@@ -766,12 +766,41 @@ def _apply_sort_order_constraint(
                    key=lambda i: results[i]['row'] * 5 + results[i]['col'])
     s = [results[i] for i in order]
     n = len(s)
+    # Physical grid positions parallel to s. When some cells were dropped by
+    # the initial CLIP pass, consecutive entries in s can be >1 grid position
+    # apart. Helpers below use pos[] to compute the expected ID gap accordingly.
+    pos = [r['row'] * 5 + r['col'] for r in s]
 
-    def _unique_candidate(lo: int, hi: int, rarity: str) -> Optional[str]:
-        """Return the single item_id in (lo, hi) exclusive with matching rarity, or None."""
+    def _unique_candidate(lo: int, hi: int, rarity: str,
+                          prefer_close_to: Optional[int] = None) -> Optional[str]:
+        """Return the single item_id in (lo, hi) exclusive with matching rarity, or None.
+
+        Dense gift-family fallback: when 2-3 same-rarity candidates fit AND both
+        bounds sit inside the gift ID range (5000-5199), AND prefer_close_to is
+        provided, pick the candidate closest to prefer_close_to. Caller computes
+        this from grid-position context so dropped cells contribute the right
+        offset (e.g. if the prev neighbour is 2 grid cells back, target is
+        prev_id+2 instead of prev_id+1).
+
+        Reads `ascending` from the enclosing scope via Python late binding.
+        """
         hits = [x for x in range(lo + 1, hi)
                 if id_to_rarity.get(str(x)) == rarity]
-        return str(hits[0]) if len(hits) == 1 else None
+        if len(hits) == 1:
+            return str(hits[0])
+        if 2 <= len(hits) <= 3 and 5000 <= lo and hi <= 5200:
+            target = prefer_close_to if prefer_close_to is not None else (
+                lo + 1 if ascending else hi - 1
+            )
+            return str(min(hits, key=lambda h: abs(h - target)))
+        return None
+
+    def _target_at(anchor_idx: int, anchor_id: int, curr_idx: int) -> int:
+        """Expected ID at sorted position `curr_idx`, anchored on the cell at
+        `anchor_idx` with value `anchor_id`. Accounts for grid-position gap so
+        dropped cells between anchor and curr contribute the right step count."""
+        gap = abs(pos[curr_idx] - pos[anchor_idx])
+        return anchor_id + gap if ascending else anchor_id - gap
 
     # Determine global sort direction once (majority vote over original IDs)
     ids0 = [int(r['itemId']) for r in s]
@@ -794,40 +823,48 @@ def _apply_sort_order_constraint(
             if ascending:
                 if prev_id < next_id and not (prev_id < curr_id < next_id):
                     # Standard: both immediate neighbours are consistent
-                    fix = _unique_candidate(prev_id, next_id, rarity)
+                    fix = _unique_candidate(prev_id, next_id, rarity,
+                                            prefer_close_to=_target_at(i - 1, prev_id, i))
                 elif prev_id >= next_id:
                     # Neighbours inconsistent — one may be wrong; try extended windows
                     if i >= 2:
                         far_prev = ids[i - 2]
                         if far_prev < next_id and not (far_prev < curr_id < next_id):
-                            fix = _unique_candidate(far_prev, next_id, rarity)
+                            fix = _unique_candidate(far_prev, next_id, rarity,
+                                                    prefer_close_to=_target_at(i - 2, far_prev, i))
                     if fix is None and i < n - 2:
                         far_next = ids[i + 2]
                         if prev_id < far_next and not (prev_id < curr_id < far_next):
-                            fix = _unique_candidate(prev_id, far_next, rarity)
+                            fix = _unique_candidate(prev_id, far_next, rarity,
+                                                    prefer_close_to=_target_at(i - 1, prev_id, i))
             else:
                 if prev_id > next_id and not (prev_id > curr_id > next_id):
-                    fix = _unique_candidate(next_id, prev_id, rarity)
+                    fix = _unique_candidate(next_id, prev_id, rarity,
+                                            prefer_close_to=_target_at(i - 1, prev_id, i))
                 elif prev_id <= next_id:
                     if i >= 2:
                         far_prev = ids[i - 2]
                         if far_prev > next_id and not (far_prev > curr_id > next_id):
-                            fix = _unique_candidate(next_id, far_prev, rarity)
+                            fix = _unique_candidate(next_id, far_prev, rarity,
+                                                    prefer_close_to=_target_at(i - 2, far_prev, i))
                     if fix is None and i < n - 2:
                         far_next = ids[i + 2]
                         if prev_id > far_next and not (prev_id > curr_id > far_next):
-                            fix = _unique_candidate(far_next, prev_id, rarity)
+                            fix = _unique_candidate(far_next, prev_id, rarity,
+                                                    prefer_close_to=_target_at(i - 1, prev_id, i))
             if fix:
                 s[i]['itemId'] = fix
                 ids[i] = int(fix)
                 changed = True
 
-        # Edge position 0
+        # Edge position 0 — anchored on s[1] (no prev). Gap-aware target uses
+        # pos[0]→pos[1] so a dropped cell between them still picks the right ID.
         rarity = s[0]['rarity']
         if ascending and ids[0] >= ids[1]:
             # Direction violation: ids[0] is too high
             lo, hi = max(0, ids[1] - 4), ids[1]
-            fix = _unique_candidate(lo, hi, rarity)
+            fix = _unique_candidate(lo, hi, rarity,
+                                    prefer_close_to=_target_at(1, ids[1], 0))
             if fix:
                 s[0]['itemId'] = fix
                 ids[0] = int(fix)
@@ -836,7 +873,8 @@ def _apply_sort_order_constraint(
             # ids[0] is going right direction but cross-family gap is suspicious;
             # ids[1] is confirmed by ids[2] so use it as anchor
             lo, hi = max(0, ids[1] - 4), ids[1]
-            fix = _unique_candidate(lo, hi, rarity)
+            fix = _unique_candidate(lo, hi, rarity,
+                                    prefer_close_to=_target_at(1, ids[1], 0))
             if fix:
                 s[0]['itemId'] = fix
                 ids[0] = int(fix)
@@ -844,7 +882,8 @@ def _apply_sort_order_constraint(
         elif not ascending and ids[0] <= ids[1]:
             # Direction violation: ids[0] is too low
             lo, hi = ids[1], ids[1] + 4
-            fix = _unique_candidate(lo, hi, rarity)
+            fix = _unique_candidate(lo, hi, rarity,
+                                    prefer_close_to=_target_at(1, ids[1], 0))
             if fix:
                 s[0]['itemId'] = fix
                 ids[0] = int(fix)
@@ -852,18 +891,21 @@ def _apply_sort_order_constraint(
         elif not ascending and n >= 3 and ids[1] > ids[2] and ids[0] - ids[1] > 4:
             # Descending: ids[0] is going right direction but cross-family gap suspicious
             lo, hi = ids[1], ids[1] + 4
-            fix = _unique_candidate(lo, hi, rarity)
+            fix = _unique_candidate(lo, hi, rarity,
+                                    prefer_close_to=_target_at(1, ids[1], 0))
             if fix:
                 s[0]['itemId'] = fix
                 ids[0] = int(fix)
                 changed = True
 
-        # Edge position n-1
+        # Edge position n-1 — anchored on s[-2] (no next). Gap-aware target uses
+        # pos[-2]→pos[-1] so a dropped cell between them still picks the right ID.
         rarity = s[-1]['rarity']
         if ascending and ids[-1] <= ids[-2]:
             # Direction violation: ids[-1] is too low
             lo, hi = ids[-2], ids[-2] + 4
-            fix = _unique_candidate(lo, hi, rarity)
+            fix = _unique_candidate(lo, hi, rarity,
+                                    prefer_close_to=_target_at(n - 2, ids[-2], n - 1))
             if fix:
                 s[-1]['itemId'] = fix
                 changed = True
@@ -871,21 +913,24 @@ def _apply_sort_order_constraint(
             # ids[-1] is going right direction but cross-family gap is suspicious;
             # ids[-2] is confirmed by ids[-3] so use it as anchor
             lo, hi = ids[-2], ids[-2] + 4
-            fix = _unique_candidate(lo, hi, rarity)
+            fix = _unique_candidate(lo, hi, rarity,
+                                    prefer_close_to=_target_at(n - 2, ids[-2], n - 1))
             if fix:
                 s[-1]['itemId'] = fix
                 changed = True
         elif not ascending and ids[-1] >= ids[-2]:
             # Direction violation: ids[-1] is too high
             lo, hi = max(0, ids[-2] - 4), ids[-2]
-            fix = _unique_candidate(lo, hi, rarity)
+            fix = _unique_candidate(lo, hi, rarity,
+                                    prefer_close_to=_target_at(n - 2, ids[-2], n - 1))
             if fix:
                 s[-1]['itemId'] = fix
                 changed = True
         elif not ascending and n >= 3 and ids[-3] > ids[-2] and ids[-2] - ids[-1] > 4:
             # Descending: ids[-1] going right direction but cross-family gap suspicious
             lo, hi = max(0, ids[-2] - 4), ids[-2]
-            fix = _unique_candidate(lo, hi, rarity)
+            fix = _unique_candidate(lo, hi, rarity,
+                                    prefer_close_to=_target_at(n - 2, ids[-2], n - 1))
             if fix:
                 s[-1]['itemId'] = fix
                 changed = True
@@ -1607,6 +1652,12 @@ def parse_inventory(image_bytes: bytes, inventory_type: str) -> List[Dict]:
         net, embeddings, labels, rarities,
         qty_lookup=qty_lookup,
     )
+    # Second sort-order pass after recovery: cells re-added by _recover_favor_items
+    # use CLIP top-1 across all favors and frequently land on the wrong in-family
+    # ID (e.g. real 5009 → recovered as 5032). With the grid-position-aware target
+    # in pass 1 having locked in the *correct* neighbours, this second pass can
+    # now narrow such mistakes to the unique candidate that fits the gap.
+    results = _apply_sort_order_constraint(results, id_to_rarity)
     _enforce_group_sort_order(
         results, icon_crops, recovered_crops, net, embeddings, labels,
     )

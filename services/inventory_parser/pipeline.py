@@ -415,12 +415,30 @@ def _build_qty_prompt(rows: int, cols: int) -> str:
     )
 
 
-def _parse_qty_json(text: str, model: str) -> Optional[Dict[Tuple[int, int], int]]:
-    """Parse Gemini's JSON array response into a {(row,col): qty} dict, or None."""
+def _build_multi_qty_prompt(n: int, rows: int, cols: int) -> str:
+    return (
+        f"There are {n} Blue Archive inventory grids, given as the first {n} images "
+        f"in order (grid 0 to grid {n - 1}). Each grid has {rows} rows × {cols} "
+        f"columns; each cell has an icon and a quantity prefixed with '×' at the "
+        f"bottom-right.\n\n"
+        f"Read the quantity for every cell in every grid. If a cell has no readable "
+        f"number, use 0. Return ONLY a JSON array, no markdown fences, each entry "
+        f"tagged with its grid index:\n"
+        f'[{{"grid":0,"row":0,"col":0,"qty":1197}},{{"grid":0,"row":0,"col":1,"qty":607}},...]'
+    )
+
+
+def _strip_json_fence(text: str) -> str:
     text = (text or '').strip()
     if text.startswith('```'):
         text = re.sub(r'^```(?:json)?\s*', '', text)
         text = re.sub(r'\s*```$', '', text)
+    return text
+
+
+def _parse_qty_json(text: str, model: str) -> Optional[Dict[Tuple[int, int], int]]:
+    """Parse a single-grid JSON response into {(row,col): qty}, or None."""
+    text = _strip_json_fence(text)
     try:
         parsed = json.loads(text)
     except (json.JSONDecodeError, ValueError) as e:
@@ -439,15 +457,36 @@ def _parse_qty_json(text: str, model: str) -> Optional[Dict[Tuple[int, int], int
     return out
 
 
-def _try_gemini_model(client, model: str, pil, prompt: str, ms: dict
-                      ) -> Optional[Dict[Tuple[int, int], int]]:
-    """Try one model (with transient-error retries). Returns the qty dict on
-    success, or None to signal the caller should advance to the next model.
-    On 429 it marks this model exhausted for the rest of the day."""
+def _parse_multi_qty_json(text: str, model: str) -> Optional[Dict[Tuple[int, int, int], int]]:
+    """Parse a multi-grid JSON response into {(grid,row,col): qty}, or None."""
+    text = _strip_json_fence(text)
+    try:
+        parsed = json.loads(text)
+    except (json.JSONDecodeError, ValueError) as e:
+        print(f'[gemini] {model} non-JSON (multi-grid): {e!r}; raw={text[:200]!r}')
+        return None
+    if not isinstance(parsed, list):
+        return None
+    out: Dict[Tuple[int, int, int], int] = {}
+    for item in parsed:
+        try:
+            g = int(item['grid']); r = int(item['row']); c = int(item['col']); q = int(item['qty'])
+            out[(g, r, c)] = q
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
+def _try_gemini_model(client, model: str, contents: list, parse_fn, ms: dict):
+    """Try one model (with transient-error retries). `contents` is the full
+    generate_content payload (images + prompt); `parse_fn(text, model)` turns
+    the response into a result dict. Returns the parsed dict on success, or None
+    to signal the caller should advance to the next model. On 429 it marks this
+    model exhausted for the rest of the day."""
     response = None
     for attempt in range(_GEMINI_TRANSIENT_RETRIES + 1):
         try:
-            response = client.models.generate_content(model=model, contents=[pil, prompt])
+            response = client.models.generate_content(model=model, contents=contents)
             break
         except Exception as e:  # noqa: BLE001
             err_str = str(e).lower()
@@ -470,39 +509,63 @@ def _try_gemini_model(client, model: str, pil, prompt: str, ms: dict
 
     if response is None:
         return None
-    out = _parse_qty_json(response.text, model)
+    out = parse_fn(response.text, model)
     if out is not None:
         ms['success'] += 1
     return out
 
 
-def _gemini_read_all_quantities(
-    grid_bgr: np.ndarray, rows: int, cols: int,
-) -> Optional[Dict[Tuple[int, int], int]]:
-    """Read every quantity in the grid via the Gemini model chain.
-
-    Tries each model in _GEMINI_MODEL_CHAIN in order, skipping any already at
-    its daily cap. Returns {(row, col): quantity} on the first success, or
-    ``None`` when the entire chain is unavailable/exhausted (callers then emit
-    quantity=0 + low confidence for manual entry).
-    """
+def _run_gemini_chain(contents: list, parse_fn):
+    """Run `contents` through the model chain, advancing on per-model exhaustion
+    or failure. Returns parse_fn's result on first success, else None."""
     client = _get_gemini_client()
     if client is None:
         return None
     _reset_gemini_day_if_needed()
-
-    from PIL import Image
-    pil = Image.fromarray(cv2.cvtColor(grid_bgr, cv2.COLOR_BGR2RGB))
-    prompt = _build_qty_prompt(rows, cols)
-
     for model, cap in _GEMINI_MODEL_CHAIN:
         ms = _gemini_model_state(model, cap)
         if ms['success'] >= ms['adaptive_cap']:
             continue  # this model exhausted today — try the next
-        out = _try_gemini_model(client, model, pil, prompt, ms)
+        out = _try_gemini_model(client, model, contents, parse_fn, ms)
         if out is not None:
             return out
     return None  # whole chain exhausted/failed
+
+
+def _grid_to_pil(grid_bgr: np.ndarray):
+    from PIL import Image
+    return Image.fromarray(cv2.cvtColor(grid_bgr, cv2.COLOR_BGR2RGB))
+
+
+def _gemini_read_all_quantities(
+    grid_bgr: np.ndarray, rows: int, cols: int,
+) -> Optional[Dict[Tuple[int, int], int]]:
+    """Read every quantity in one grid via the Gemini model chain.
+
+    Returns {(row, col): quantity} on the first model success, or ``None`` when
+    the entire chain is unavailable/exhausted (callers then emit quantity=0 +
+    low confidence for manual entry).
+    """
+    contents = [_grid_to_pil(grid_bgr), _build_qty_prompt(rows, cols)]
+    return _run_gemini_chain(contents, _parse_qty_json)
+
+
+def _gemini_read_all_quantities_batched(
+    grids_meta: List[Tuple[np.ndarray, int, int]],
+) -> Optional[Dict[Tuple[int, int, int], int]]:
+    """Read quantities for up to 3 grids in ONE Gemini call (RPD-efficient).
+
+    `grids_meta` is a list of (grid_bgr, rows, cols), all same inventory type.
+    Returns {(grid_idx, row, col): quantity} or ``None`` if the chain
+    failed/exhausted — callers should then retry per-grid before degrading.
+    Multi-grid batching is reliable up to 3 grids (validated); beyond that the
+    model starts scrambling the middle grid, so callers must cap the batch.
+    """
+    n = len(grids_meta)
+    rows, cols = grids_meta[0][1], grids_meta[0][2]
+    contents = [_grid_to_pil(g) for g, _, _ in grids_meta]
+    contents.append(_build_multi_qty_prompt(n, rows, cols))
+    return _run_gemini_chain(contents, _parse_multi_qty_json)
 
 
 def _lookup_or_read_quantity(
@@ -1573,44 +1636,53 @@ def _demote_suspect_confidences(results: List[Dict], rows: int, cols: int) -> No
             r['confidence'] = _SUSPECT_CONF
 
 
-def parse_inventory(image_bytes: bytes, inventory_type: str) -> List[Dict]:
-    if inventory_type not in ('items', 'equipment'):
-        return []
+def _extract_grid(image_bytes: bytes, inventory_type: str):
+    """Decode one screenshot and locate its inventory grid.
 
+    Returns (grid_bgr, rows, cols, cell_w, row_bounds) or None if the image is
+    unreadable or no grid could be located.
+    """
     data = np.frombuffer(image_bytes, np.uint8)
     image = cv2.imdecode(data, cv2.IMREAD_COLOR)
     if image is None:
-        return []
+        return None
 
     height, width = image.shape[:2]
-    right_half = image[:, width // 2 :]
+    right_half = image[:, width // 2:]
 
     left, top, right, bottom = _compute_grid_bounds(right_half, inventory_type)
     if right <= left or bottom <= top:
-        return []
+        return None
 
     grid = right_half[top:bottom, left:right]
-    grid_h, grid_w = grid.shape[:2]
+    grid_w = grid.shape[1]
 
-    # Equipment screenshots show 5 rows; items show 4.
-    # _compute_grid_bounds uses a taller fallback bottom ratio for equipment
-    # (0.95 vs 0.78) so the grid height already covers the full 5-row area.
+    # Equipment screenshots show 5 rows; items show 4. _compute_grid_bounds uses
+    # a taller fallback bottom ratio for equipment so the grid already covers it.
     rows = 5 if inventory_type == 'equipment' else 4
     cols = 5
     cell_w = grid_w / cols
 
-    # Detect actual row boundaries (handles scroll-misaligned screenshots)
     row_bounds = _detect_row_boundaries(grid, rows)
-
-    # When scroll-offset is detected, the last row is clipped at the grid
-    # bottom.  Extend the grid downward so the quantity text isn't cut off.
+    # When scroll-offset is detected, the last row is clipped at the grid bottom;
+    # extend the grid downward so the quantity text isn't cut off.
     scroll_offset = row_bounds[0]
     if scroll_offset > 10:
         extended_bottom = min(bottom + scroll_offset, right_half.shape[0])
         grid = right_half[top:extended_bottom, left:right]
-        grid_h = grid.shape[0]
-        row_bounds[-1] = grid_h
+        row_bounds[-1] = grid.shape[0]
 
+    return grid, rows, cols, cell_w, row_bounds
+
+
+def _classify_and_correct(grid, rows, cols, cell_w, row_bounds,
+                          inventory_type, qty_lookup) -> List[Dict]:
+    """Classify icons + apply all correction passes for ONE grid.
+
+    Returns results with 0-based row indices. `qty_lookup` is this grid's
+    {(row, col): qty} (or None → quantities degrade to 0 + red confidence).
+    Callers offset the row index per screenshot when combining batches.
+    """
     net, embeddings, labels = _load_embeddings(inventory_type)
     if net is None:
         print(f'[inventory_parser] No embeddings for {inventory_type} — run embed.py first')
@@ -1619,23 +1691,12 @@ def parse_inventory(image_bytes: bytes, inventory_type: str) -> List[Dict]:
     rarities = _load_rarities(inventory_type)
     shapes   = _load_shapes(inventory_type)
 
-    # Read all quantities once via the Gemini model chain. On success we get a
-    # {(row, col): qty} lookup used by both _process_grid_cells and
-    # _recover_favor_items. On total chain exhaustion this is None and both
-    # pass-throughs emit quantity=0 + low confidence for manual entry.
-    qty_lookup = _gemini_read_all_quantities(grid, rows, cols)
-    if qty_lookup is not None:
-        print(f'[inventory_parser] Gemini OCR ok ({len(qty_lookup)} cells)')
-    else:
-        print('[inventory_parser] Gemini chain exhausted — quantities default to 0 for manual entry')
-
     results, icon_crops = _process_grid_cells(
         grid, rows, cols, cell_w, row_bounds,
         net, embeddings, labels, rarities, shapes,
         qty_lookup=qty_lookup,
     )
 
-    # Build id → rarity lookup from loaded embedding metadata and apply sort-order fix
     id_to_rarity = {item_id: rarities.get(row_idx, 'Unknown')
                     for row_idx, item_id in labels.items()}
     results = _apply_sort_order_constraint(results, id_to_rarity)
@@ -1647,23 +1708,79 @@ def parse_inventory(image_bytes: bytes, inventory_type: str) -> List[Dict]:
         net, embeddings, labels, rarities,
         qty_lookup=qty_lookup,
     )
-    # Second sort-order pass after recovery: cells re-added by _recover_favor_items
-    # use CLIP top-1 across all favors and frequently land on the wrong in-family
-    # ID (e.g. real 5009 → recovered as 5032). With the grid-position-aware target
-    # in pass 1 having locked in the *correct* neighbours, this second pass can
-    # now narrow such mistakes to the unique candidate that fits the gap.
+    # Second sort-order pass after recovery (see Phase A notes): recovered cells
+    # use CLIP top-1 and can land on the wrong in-family ID; this narrows them.
     results = _apply_sort_order_constraint(results, id_to_rarity)
     _enforce_group_sort_order(
         results, icon_crops, recovered_crops, net, embeddings, labels,
     )
-
-    # Final UX pass: flag remaining suspect cells (Mode B out-of-library
-    # substitutions, Mode C tail-zone ambiguity) by demoting their confidence
-    # so the FE highlights them red. Does not touch itemId.
     _demote_suspect_confidences(results, rows, cols)
 
-    # _recover_favor_items appends recovered cells at the end of the list.
-    # Re-sort into row-major order so the frontend can use index-based layout.
     results.sort(key=lambda r: r['row'] * 5 + r['col'])
-
     return results
+
+
+def parse_inventory_batch(images: List[bytes], inventory_type: str) -> List[Dict]:
+    """Parse 1-3 screenshots of the same inventory type in one pass.
+
+    Quantities are read in a single batched Gemini call across all grids (RPD-
+    efficient); on batch failure each grid is retried with an individual call
+    before degrading to quantity=0. Each screenshot's rows are offset by
+    grid_index × rows_per_screenshot so the FE groups them as #1, #2, #3.
+    """
+    if inventory_type not in ('items', 'equipment'):
+        return []
+
+    rows_per = 5 if inventory_type == 'equipment' else 4
+
+    extracted = []  # (grid, rows, cols, cell_w, row_bounds) per readable screenshot
+    for img_bytes in images:
+        meta = _extract_grid(img_bytes, inventory_type)
+        if meta is not None:
+            extracted.append(meta)
+    if not extracted:
+        return []
+
+    # Build per-grid {(row,col): qty}. For >1 grid, one batched Gemini call;
+    # fall back to per-grid single calls on batch failure (handles the multi-grid
+    # prompt occasionally misbehaving, and transient errors) before degrading.
+    per_grid: List[Optional[Dict[Tuple[int, int], int]]]
+    if len(extracted) > 1:
+        grids_for_gemini = [(g, r, c) for g, r, c, _, _ in extracted]
+        batched = _gemini_read_all_quantities_batched(grids_for_gemini)
+        if batched is not None:
+            print(f'[inventory_parser] Gemini batch OCR ok '
+                  f'({len(batched)} cells across {len(extracted)} grids)')
+            per_grid = [{} for _ in extracted]
+            for (gi, r, c), q in batched.items():
+                if 0 <= gi < len(extracted):
+                    per_grid[gi][(r, c)] = q
+        else:
+            print('[inventory_parser] batch OCR failed — retrying per-grid')
+            per_grid = [_gemini_read_all_quantities(g, r, c)
+                        for g, r, c, _, _ in extracted]
+    else:
+        g, r, c, _, _ = extracted[0]
+        single = _gemini_read_all_quantities(g, r, c)
+        if single is not None:
+            print(f'[inventory_parser] Gemini OCR ok ({len(single)} cells)')
+        else:
+            print('[inventory_parser] Gemini chain exhausted — quantities default to 0')
+        per_grid = [single]
+
+    combined: List[Dict] = []
+    for gi, (grid, rows, cols, cell_w, row_bounds) in enumerate(extracted):
+        res = _classify_and_correct(grid, rows, cols, cell_w, row_bounds,
+                                    inventory_type, per_grid[gi])
+        offset = gi * rows_per
+        for r in res:
+            r['row'] += offset
+        combined.extend(res)
+
+    combined.sort(key=lambda r: r['row'] * 5 + r['col'])
+    return combined
+
+
+def parse_inventory(image_bytes: bytes, inventory_type: str) -> List[Dict]:
+    """Single-screenshot entry point — thin wrapper over parse_inventory_batch."""
+    return parse_inventory_batch([image_bytes], inventory_type)

@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import time
 from typing import Dict, List, Optional, Tuple
 from urllib import request, error
 
@@ -328,6 +329,11 @@ def warm_icon_db() -> None:
         _load_rarities(inv_type)
         _load_shapes(inv_type)
     _get_or_load_florence()
+    # Initialise the Gemini SDK client at startup (cheap, no network call) so
+    # the "Gemini client ready" log and any config issues (missing key, import
+    # error) surface at boot instead of on the first user request. Falls back
+    # silently to lazy init if the key isn't present.
+    _get_gemini_client()
 
 
 def _get_or_load_florence():
@@ -484,6 +490,13 @@ _GEMINI_DAILY_LIMIT = 1000   # conservative; free tier nominally allows ~1500/da
 _GEMINI_CLIENT = None
 _gemini_state = {'date': None, 'success': 0, 'adaptive_cap': _GEMINI_DAILY_LIMIT}
 
+# 503/500/UNAVAILABLE are transient Google-side overloads (free tier gets shed
+# first under load). Unlike 429 quota errors, the same request usually succeeds
+# on a short retry — so retry these a couple times before dropping to Florence-2.
+# Worst-case added latency is 2+4=6s, far cheaper than the ~240s CPU fallback.
+_GEMINI_TRANSIENT_RETRIES = 2
+_GEMINI_RETRY_BACKOFF = 2.0  # seconds; doubles each attempt (2s, then 4s)
+
 
 def _get_gemini_client():
     """Lazy-load the Gemini client. Returns None if no API key configured."""
@@ -549,17 +562,34 @@ def _gemini_read_all_quantities(
         f'[{{"row":0,"col":0,"qty":1197}},{{"row":0,"col":1,"qty":607}},...]'
     )
 
-    try:
-        response = client.models.generate_content(
-            model=_GEMINI_MODEL,
-            contents=[pil, prompt],
-        )
-    except Exception as e:  # noqa: BLE001
-        err_str = str(e).lower()
-        if any(s in err_str for s in ('429', 'quota', 'resource_exhausted', 'rate')):
-            _record_gemini_quota_error(e)
-        else:
+    response = None
+    for attempt in range(_GEMINI_TRANSIENT_RETRIES + 1):
+        try:
+            response = client.models.generate_content(
+                model=_GEMINI_MODEL,
+                contents=[pil, prompt],
+            )
+            break  # success
+        except Exception as e:  # noqa: BLE001
+            err_str = str(e).lower()
+            # Quota / rate limit — back off for the rest of the day, no retry.
+            if any(s in err_str for s in ('429', 'quota', 'resource_exhausted', 'rate')):
+                _record_gemini_quota_error(e)
+                return None
+            # Transient server overload — retry with backoff before giving up.
+            is_transient = any(s in err_str for s in
+                               ('503', '500', 'unavailable', 'overloaded', 'internal'))
+            if is_transient and attempt < _GEMINI_TRANSIENT_RETRIES:
+                delay = _GEMINI_RETRY_BACKOFF * (2 ** attempt)
+                print(f'[gemini] transient error (attempt {attempt + 1}/'
+                      f'{_GEMINI_TRANSIENT_RETRIES + 1}), retrying in {delay:.0f}s: {e}')
+                time.sleep(delay)
+                continue
+            # Non-transient error, or retries exhausted — fall back to Florence-2.
             print(f'[gemini] error, falling back to Florence-2: {e}')
+            return None
+
+    if response is None:
         return None
 
     text = (response.text or '').strip()

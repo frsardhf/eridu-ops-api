@@ -17,13 +17,13 @@ Screenshot PNG
   → OpenCV: decode + crop right-half (inventory panel side)
   → Grid detection: template-match the "List" header + footer to find grid bounds
   → Row boundary detection: HSV saturation analysis to find actual row gaps
-  → Gemini Flash: one API call on the full grid image → {(row,col): qty} lookup dict
-        (falls back to per-cell Florence-2 if key missing or Gemini unavailable)
+  → Gemini model chain: one API call on the full grid image → {(row,col): qty} lookup dict
+        (tries 3.1-flash-lite → 2.5-flash → 3.5-flash → 2.5-flash-lite in order)
   → Per-cell loop (5 cols × 4–5 rows):
       ① Rarity: HSV color of cell border ring (green=R, orange=SR, pink=SSR)
       ② Icon ID: CLIP ViT-B/32 embedding → cosine similarity vs ~90 precomputed embeddings
              + shape re-ranking (circularity/aspect ratio) + rarity re-ranking
-      ③ Quantity: Gemini lookup (fast path) or Florence-2 OCR on upscaled 3× crop (fallback)
+      ③ Quantity: from the Gemini lookup; if the whole chain is exhausted → 0 + red confidence (manual entry)
   → Correction passes:
       ① Sort-order constraint (enforce monotonic IDs per sort direction)
       ② Range outlier fix (ID 3500 can't appear between IDs 200 and 210)
@@ -39,22 +39,20 @@ Screenshot PNG
 | Web server | Flask + Flask-CORS, Gunicorn, Nginx |
 | Image processing | OpenCV, NumPy |
 | Icon matching | CLIP ViT-B/32 (Hugging Face Transformers + PyTorch), precomputed `.npy` embeddings |
-| OCR — fast path | Gemini Flash 2.5 (`google-genai`): one call per screenshot, reads all 20 cells at once (~6s) |
-| OCR — fallback | Florence-2 (`microsoft/Florence-2-base`): per-cell VLM OCR, used when Gemini key is absent, daily quota is exhausted, or any API error occurs (~240s on CPU) |
+| Quantity OCR | Gemini model chain (`google-genai`): one call per screenshot reads all cells at once (~6s) |
 | Math helpers | SciPy (`uniform_filter1d` for row detection) |
 | Icon data | Fetched from SchaleDB (`download_icons.py`), embeddings precomputed offline by `embed.py` |
 | Deployment | Ubuntu 24.04 VPS, Let's Encrypt SSL, systemd service |
 
 ### OCR architecture decision
 
-Quantity reading went through three candidates before landing on the current hybrid:
+Quantity reading is now handled entirely by a **chain of free-tier Gemini models** — no self-hosted OCR. How we got here:
 
-- **EasyOCR** (original): traditional detect-then-recognize pipeline. 98% accuracy on English digits in testing, but slow (~30s per screenshot on CPU due to CRAFT text detector overhead on small crops) and adds a heavy dependency (~1 GB).
-- **RapidOCR / PaddleOCR-ONNX** (evaluated): DBNet detector, faster inference, but 90% accuracy on English and 43% on Japanese quantity labels — worse than EasyOCR on this task. Ruled out.
-- **Florence-2** (current fallback): Microsoft's vision-language model. Handles the OCR task well and shares the PyTorch runtime already needed for CLIP, so no extra dependency. ~240s on CPU, ~20s on Apple Silicon MPS.
-- **Gemini Flash 2.5** (primary fast path): sends the entire grid image to Google's API once per screenshot, returns all 20 quantities in ~6s. Free tier is sufficient for typical usage (~1500 req/day). An adaptive daily cap auto-lowers on the first 429 and resets at UTC midnight.
+- **EasyOCR / RapidOCR** (early): traditional detect-then-recognize. Decent accuracy but slow on CPU (~30s) and a heavy dependency.
+- **Florence-2** (removed): Microsoft's VLM. Accurate (~99%) but **~4 min per screenshot on the VPS CPU** — too slow to be a usable fallback. The only way to make it fast is a GPU/Mac Mini, at which point a hosted API is simpler and better.
+- **Gemini chain** (current): one API call sends the whole grid; the model returns every quantity in ~6s at ~100% digit accuracy. Models are tried in order — `3.1-flash-lite` (500 RPD) → `2.5-flash` → `3.5-flash` → `2.5-flash-lite`. Free-tier rate limits are **per-model**, so chaining sums to ~544 requests/day. Each model has its own daily counter (reset at Pacific midnight, matching Google's RPD boundary) and advances to the next on a 429.
 
-The hybrid keeps Florence-2 as a fully self-contained fallback so the service works without any API key — useful for local dev and as a safety net when the Gemini quota runs out.
+**Direction:** Gemini-only, no offline fallback. When the entire chain is exhausted, cells return `quantity=0` with low (red) confidence so the user types the numbers manually — icon detection (local CLIP) still resolves the correct items. A fast result with a few blanks beats a 4-minute Florence wait. This also drops `timm`/`einops` and the heavy Florence weights from the deploy.
 
 ## Key files
 
@@ -82,7 +80,8 @@ python download_icons.py
 python embed.py items
 python embed.py equipment
 
-# Optional: add Gemini key for the fast OCR path (falls back to Florence-2 without it)
+# Gemini API key is required for quantity OCR (without it, quantities default to 0
+# for manual entry — icon detection still works). Get one from Google AI Studio.
 echo "GEMINI_API_KEY=your_key_here" > ../../.env
 
 # Run dev server

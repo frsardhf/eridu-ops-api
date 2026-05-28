@@ -4,32 +4,31 @@ A single-endpoint REST API that reads **Blue Archive** inventory screenshots and
 
 ## What it does
 
-1. Accept a PNG screenshot + `inventoryType` (`items` or `equipment`) via `POST /inventory/parse`
-2. Parse out up to a 5×4 or 5×5 grid of item cells from the screenshot
+1. Accept **1–3** PNG screenshots + `inventoryType` (`items` or `equipment`) via `POST /inventory/parse`
+2. Parse out up to a 5×4 or 5×5 grid of item cells from each screenshot
 3. For each cell: identify the item, detect its rarity, and read the quantity number
 4. Apply correction passes to fix misidentified cells
-5. Return `{ results: [{ row, col, itemId, rarity, quantity, confidence }] }`
+5. Return `{ results: [{ row, col, itemId, rarity, quantity, confidence }] }`, with each screenshot's rows offset by its position so the frontend groups them (#1, #2, #3)
 
 ## Flow
 
 ```
-Screenshot PNG
-  → OpenCV: decode + crop right-half (inventory panel side)
-  → Grid detection: template-match the "List" header + footer to find grid bounds
-  → Row boundary detection: HSV saturation analysis to find actual row gaps
-  → Gemini model chain: one API call on the full grid image → {(row,col): qty} lookup dict
-        (tries 3.1-flash-lite → 2.5-flash → 3.5-flash → 2.5-flash-lite in order)
-  → Per-cell loop (5 cols × 4–5 rows):
+1–3 screenshots (same inventory type)
+  → Per screenshot: OpenCV decode + crop right-half → grid bounds → row boundaries
+  → Gemini model chain: ONE batched API call across all grids → {(grid,row,col): qty}
+        (tries 3.1-flash-lite → 2.5-flash → 3.5-flash → 2.5-flash-lite in order;
+         on batch failure, retries each grid individually before degrading)
+  → Per grid, per-cell loop (5 cols × 4–5 rows):
       ① Rarity: HSV color of cell border ring (green=R, orange=SR, pink=SSR)
       ② Icon ID: CLIP ViT-B/32 embedding → cosine similarity vs ~90 precomputed embeddings
              + shape re-ranking (circularity/aspect ratio) + rarity re-ranking
       ③ Quantity: from the Gemini lookup; if the whole chain is exhausted → 0 + red confidence (manual entry)
-  → Correction passes:
+  → Correction passes (per grid):
       ① Sort-order constraint (enforce monotonic IDs per sort direction)
       ② Range outlier fix (ID 3500 can't appear between IDs 200 and 210)
       ③ Favor item recovery (SSR gifts at ID 5100+ are rare, re-scan for them)
       ④ Group sort enforcement (within contiguous same-category runs)
-  → JSON response
+  → Offset each grid's rows by grid_index × rows_per_screenshot → JSON response
 ```
 
 ## Tech stack
@@ -39,7 +38,7 @@ Screenshot PNG
 | Web server | Flask + Flask-CORS, Gunicorn, Nginx |
 | Image processing | OpenCV, NumPy |
 | Icon matching | CLIP ViT-B/32 (Hugging Face Transformers + PyTorch), precomputed `.npy` embeddings |
-| Quantity OCR | Gemini model chain (`google-genai`): one call per screenshot reads all cells at once (~6s) |
+| Quantity OCR | Gemini model chain (`google-genai`): one batched call reads all cells across 1–3 screenshots at once (~6s) |
 | Math helpers | SciPy (`uniform_filter1d` for row detection) |
 | Icon data | Fetched from SchaleDB (`download_icons.py`), embeddings precomputed offline by `embed.py` |
 | Deployment | Ubuntu 24.04 VPS, Let's Encrypt SSL, systemd service |
@@ -53,6 +52,12 @@ Quantity reading is now handled entirely by a **chain of free-tier Gemini models
 - **Gemini chain** (current): one API call sends the whole grid; the model returns every quantity in ~6s at ~100% digit accuracy. Models are tried in order — `3.1-flash-lite` (500 RPD) → `2.5-flash` → `3.5-flash` → `2.5-flash-lite`. Free-tier rate limits are **per-model**, so chaining sums to ~544 requests/day. Each model has its own daily counter (reset at Pacific midnight, matching Google's RPD boundary) and advances to the next on a 429.
 
 **Direction:** Gemini-only, no offline fallback. When the entire chain is exhausted, cells return `quantity=0` with low (red) confidence so the user types the numbers manually — icon detection (local CLIP) still resolves the correct items. A fast result with a few blanks beats a 4-minute Florence wait. This also drops `timm`/`einops` and the heavy Florence weights from the deploy.
+
+### Batching (1–3 screenshots per request)
+
+Free-tier RPD is **per-model**, so a single screenshot still costs one request from one model. To stretch that budget, the frontend uploads up to **3** screenshots in one request and the backend reads them in a **single batched Gemini call** (all grids in one `generate_content`, each cell tagged with its grid index) — 3 screenshots → 1 request instead of 3.
+
+The cap is **3, not higher**: a gating test showed multi-grid accuracy is 100% at N≤3 but drops to ~82% at N=5, where the model starts scrambling the *middle* grid's rows. So 3 is the validated ceiling (and conveniently matches the original EasyOCR limit). On any batch failure, each grid is retried as an individual call before degrading. Frontend downscales every screenshot to FHD width before upload, so 3 shots stay well under the 10 MB request cap and the parser stays at its tuned resolution.
 
 ## Key files
 
@@ -127,10 +132,13 @@ systemctl restart eridu-parser
 
 | Field | Type | Description |
 |---|---|---|
-| `image` | file | PNG/JPG/WebP screenshot (max 10 MB) |
+| `images` | file (×1–3) | PNG/JPG/WebP screenshots, all the same inventory type (10 MB total request cap). Repeat the field for multiple. |
+| `image` | file | Legacy single-file field — still accepted for backward compatibility. |
 | `inventoryType` | string | `"items"` or `"equipment"` |
 
 **Response**
+
+Rows are global across the batch: screenshot #1 → rows `0..3` (items) / `0..4` (equipment), screenshot #2 → the next block, and so on. The frontend groups by `floor(row / rows_per_screenshot)`.
 
 ```json
 {

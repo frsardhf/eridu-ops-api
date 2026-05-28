@@ -100,9 +100,6 @@ _EMBED_CACHE: Dict[str, Tuple[object, np.ndarray, Dict[str, str]]] = {}
 _RARITY_CACHE: Dict[str, Dict[str, str]] = {}
 # {inventory_type: {str(row_index): {circularity, aspect_ratio}}}
 _SHAPE_CACHE: Dict[str, Dict[str, dict]] = {}
-# Florence-2 model + processor — loaded once on first quantity read.
-_FLORENCE_MODEL     = None
-_FLORENCE_PROCESSOR = None
 
 
 def get_item_icon_url(icon: str, item_type: str, tier: Optional[int] = None) -> str:
@@ -328,7 +325,6 @@ def warm_icon_db() -> None:
         _load_embeddings(inv_type)
         _load_rarities(inv_type)
         _load_shapes(inv_type)
-    _get_or_load_florence()
     # Initialise the Gemini SDK client at startup (cheap, no network call) so
     # the "Gemini client ready" log and any config issues (missing key, import
     # error) surface at boot instead of on the first user request. Falls back
@@ -336,164 +332,38 @@ def warm_icon_db() -> None:
     _get_gemini_client()
 
 
-def _get_or_load_florence():
-    """Load Florence-2-base model and processor once, cache globally."""
-    global _FLORENCE_MODEL, _FLORENCE_PROCESSOR
-    if _FLORENCE_MODEL is None:
-        import torch
-        from transformers import AutoProcessor, AutoModelForCausalLM
-        print('[inventory_parser] Loading Florence-2 OCR model')
-        import transformers as _tf
-        _tf_major = int(_tf.__version__.split('.')[0])
-        # transformers 5.x introduced a fast CLIPImageProcessor that changes image
-        # sizes and breaks Florence-2's square-feature-map assertion — disable it.
-        # transformers 4.x has no fast image processor; use_fast=False there forces
-        # the slow BART tokenizer which needs merges.txt (not shipped by Florence-2).
-        _proc_kwargs = {'use_fast': False} if _tf_major >= 5 else {}
-        _FLORENCE_PROCESSOR = AutoProcessor.from_pretrained(
-            'microsoft/Florence-2-base',
-            trust_remote_code=True,
-            **_proc_kwargs,
-        )
-        # transformers 4.x uses `dtype`, 5.x renamed it to `torch_dtype`
-        _dtype_kwarg = 'torch_dtype' if _tf_major >= 5 else 'dtype'
-        _FLORENCE_MODEL = AutoModelForCausalLM.from_pretrained(
-            'microsoft/Florence-2-base',
-            **{_dtype_kwarg: torch.float32},
-            trust_remote_code=True,
-            attn_implementation='eager',  # bypass SDPA dispatch; Florence-2 doesn't declare _supports_sdpa
-        )
-        # transformers 5.x removed _tie_or_clone_weights; manually share tensors
-        # so that lm_head / embed_tokens use the loaded shared embedding weights.
-        lm = _FLORENCE_MODEL.language_model
-        shared_w = lm.model.shared.weight
-        lm.model.encoder.embed_tokens.weight = shared_w
-        lm.model.decoder.embed_tokens.weight = shared_w
-        lm.lm_head.weight = shared_w
-        _FLORENCE_MODEL = _FLORENCE_MODEL.eval()
-        print('[inventory_parser] Florence-2 ready')
-    return _FLORENCE_MODEL, _FLORENCE_PROCESSOR
-
-
-def _parse_quantity_from_text(text: str) -> Tuple[int, float]:
-    """Parse a quantity integer from Florence-2 OCR output text.
-
-    Full-cell output example: "T8 ×1408" → 1408.
-    Returns (quantity, confidence).
-    """
-    if not text:
-        return 0, 0.0
-
-    m = re.search(r'[×X]([\dX]+[KkMm]?)', text)
-    if m:
-        qty_raw = m.group(1).upper()
-    else:
-        groups = re.findall(r'\d+[KkMm]?', text)
-        if not groups:
-            return 0, 0.3
-        qty_raw = groups[-1].upper()
-
-    # Trailing 'X' after a digit → the digit '5' was misread as × (JP font).
-    if qty_raw.endswith('X') and len(qty_raw) >= 2 and qty_raw[-2].isdigit():
-        qty_raw = qty_raw[:-1] + '5'
-
-    multiplier = 1
-    if qty_raw.endswith('M'):
-        before_m = qty_raw[:-1]
-        if len(before_m) == 1 and before_m.isdigit():
-            qty_raw = before_m + '7'
-        else:
-            multiplier = 1_000_000
-            qty_raw = before_m
-    elif qty_raw.endswith('K'):
-        multiplier = 1_000
-        qty_raw = qty_raw[:-1]
-
-    digits = re.sub(r'[^0-9]', '', qty_raw)
-    if not digits:
-        return 0, 0.3
-
-    try:
-        return int(digits) * multiplier, 0.9
-    except ValueError:
-        return 0, 0.3
-
-
-def _read_quantities_batch(slots_bgr: List[np.ndarray]) -> List[Tuple[int, float]]:
-    """Run Florence-2 OCR on a batch of slot images in one forward pass.
-
-    Batching all cells together is ~N× faster than N sequential calls on CPU
-    because the encoder runs once across the batch and the decoder steps run
-    in parallel across batch items.
-    """
-    from PIL import Image
-    import torch
-    import transformers as _tf
-
-    if not slots_bgr:
-        return []
-
-    model, processor = _get_or_load_florence()
-    _tf_major = int(_tf.__version__.split('.')[0])
-
-    pil_imgs = [
-        Image.fromarray(cv2.cvtColor(s, cv2.COLOR_BGR2RGB))
-        for s in slots_bgr
-    ]
-    n = len(pil_imgs)
-
-    inputs = processor(
-        text=['<OCR>'] * n,
-        images=pil_imgs,
-        return_tensors='pt',
-        padding=True,
-    )
-    with torch.no_grad():
-        # use_cache=False needed on transformers 5.x: EncoderDecoderCache format
-        # is incompatible with Florence-2's decoder tuple indexing.
-        # On transformers 4.x the old tuple cache works fine — keep it enabled
-        # for faster decoding.
-        output_ids = model.generate(
-            **inputs,
-            max_new_tokens=20,
-            do_sample=False,
-            num_beams=1,    # greedy — Florence-2 defaults num_beams=3; forcing 1 is ~3× faster
-            use_cache=False,  # Florence-2's prepare_inputs_for_generation accesses
-                              # past_key_values[0][0] unconditionally; with cache enabled
-                              # the initial None entry crashes on any batch size.
-        )
-
-    return [
-        _parse_quantity_from_text(
-            processor.decode(output_ids[i], skip_special_tokens=True).upper().strip()
-        )
-        for i in range(n)
-    ]
-
-
-def _read_quantity(slot_bgr: np.ndarray) -> Tuple[int, float]:
-    """Read quantity from a single slot image (thin wrapper around batch version)."""
-    h, w = slot_bgr.shape[:2]
-    if h == 0 or w == 0:
-        return 0, 0.0
-    return _read_quantities_batch([slot_bgr])[0]
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Gemini Flash OCR — fast path (~6s/screenshot vs ~240s for Florence-2 on CPU)
-# Falls back to Florence-2 on rate-limit / error / missing key.
+# Gemini Flash OCR — the sole quantity reader (Florence-2 removed). A chain of
+# free-tier models is tried in order; rate limits are PER-MODEL per-project, so
+# chaining multiplies daily capacity. When the whole chain is exhausted, callers
+# get quantity=0 + low confidence and the user fills blanks manually.
 # ─────────────────────────────────────────────────────────────────────────────
-from datetime import datetime, timezone as _tz
+from datetime import datetime, timezone as _tz, timedelta
 
-_GEMINI_MODEL = 'gemini-2.5-flash'
-_GEMINI_DAILY_LIMIT = 1000   # conservative; free tier nominally allows ~1500/day
+try:
+    from zoneinfo import ZoneInfo
+    _PACIFIC = ZoneInfo('America/Los_Angeles')
+except Exception:  # tzdata unavailable — fixed UTC-8 fallback (ignores DST drift)
+    _PACIFIC = _tz(timedelta(hours=-8))
+
+# Ordered fallback chain of (model, daily_cap). Free-tier RPD is per-model, so a
+# 429 on one model just advances to the next — combined ≈ 544 RPD/day. Caps are
+# set just under each model's observed free-tier RPD ceiling. All entries are
+# vision-capable text-out models confirmed available on this project's free tier.
+_GEMINI_MODEL_CHAIN = [
+    ('gemini-3.1-flash-lite', 490),  # 500 RPD / 15 RPM — primary
+    ('gemini-2.5-flash',       18),  # 20 RPD / 5 RPM
+    ('gemini-3.5-flash',       18),  # 20 RPD / 5 RPM
+    ('gemini-2.5-flash-lite',  18),  # 20 RPD / 10 RPM
+]
 _GEMINI_CLIENT = None
-_gemini_state = {'date': None, 'success': 0, 'adaptive_cap': _GEMINI_DAILY_LIMIT}
+# {'date': pacific_date, 'models': {model: {'success': int, 'adaptive_cap': int}}}
+_gemini_state = {'date': None, 'models': {}}
 
 # 503/500/UNAVAILABLE are transient Google-side overloads (free tier gets shed
 # first under load). Unlike 429 quota errors, the same request usually succeeds
-# on a short retry — so retry these a couple times before dropping to Florence-2.
-# Worst-case added latency is 2+4=6s, far cheaper than the ~240s CPU fallback.
+# on a short retry — so retry these a couple times before advancing to the next
+# model in the chain. Worst-case added latency per model is 2+4=6s.
 _GEMINI_TRANSIENT_RETRIES = 2
 _GEMINI_RETRY_BACKOFF = 2.0  # seconds; doubles each attempt (2s, then 4s)
 
@@ -508,51 +378,33 @@ def _get_gemini_client():
         try:
             from google import genai
             _GEMINI_CLIENT = genai.Client(api_key=api_key)
-            print(f'[inventory_parser] Gemini client ready ({_GEMINI_MODEL})')
+            primary = _GEMINI_MODEL_CHAIN[0][0]
+            print(f'[inventory_parser] Gemini client ready (primary: {primary})')
         except ImportError:
             print('[inventory_parser] google-genai not installed — skipping Gemini')
             return None
     return _GEMINI_CLIENT
 
 
-def _under_gemini_cap() -> bool:
-    """True if we still have budget today. Resets at UTC midnight."""
-    today = datetime.now(_tz.utc).date()
+def _reset_gemini_day_if_needed() -> None:
+    """Clear per-model counters at Pacific midnight (Google's RPD reset boundary)."""
+    today = datetime.now(_PACIFIC).date()
     if _gemini_state['date'] != today:
         _gemini_state['date'] = today
-        _gemini_state['success'] = 0
-        _gemini_state['adaptive_cap'] = _GEMINI_DAILY_LIMIT
-    return _gemini_state['success'] < _gemini_state['adaptive_cap']
+        _gemini_state['models'] = {}
 
 
-def _record_gemini_quota_error(err: Exception) -> None:
-    """Drop the adaptive cap to current success count so we stop trying today."""
-    n = _gemini_state['success']
-    _gemini_state['adaptive_cap'] = n
-    print(f'[gemini] quota hit at {n} reqs today — cap lowered, falling back to Florence-2')
-    if n < 500:
-        print(f'[gemini] ALERT: cap dropped below 500 — Google may have lowered free tier ({err})')
+def _gemini_model_state(model: str, cap: int) -> dict:
+    """Get-or-create the per-model daily counter."""
+    ms = _gemini_state['models'].get(model)
+    if ms is None:
+        ms = {'success': 0, 'adaptive_cap': cap}
+        _gemini_state['models'][model] = ms
+    return ms
 
 
-def _gemini_read_all_quantities(
-    grid_bgr: np.ndarray, rows: int, cols: int,
-) -> Optional[Dict[Tuple[int, int], int]]:
-    """One Gemini call to read every quantity in the grid.
-
-    Returns a dict mapping ``(row, col) -> quantity``, or ``None`` when
-    Gemini is unavailable (no key, daily cap hit, or runtime error). Callers
-    should fall back to Florence-2 per-cell OCR when this returns None.
-    """
-    if not _under_gemini_cap():
-        return None
-    client = _get_gemini_client()
-    if client is None:
-        return None
-
-    from PIL import Image
-
-    pil = Image.fromarray(cv2.cvtColor(grid_bgr, cv2.COLOR_BGR2RGB))
-    prompt = (
+def _build_qty_prompt(rows: int, cols: int) -> str:
+    return (
         f"This is a Blue Archive game inventory grid with {rows} rows × {cols} "
         f"columns of item cells. Each cell has an icon and a quantity number "
         f"prefixed with '×' at the bottom-right.\n\n"
@@ -562,51 +414,21 @@ def _gemini_read_all_quantities(
         f'[{{"row":0,"col":0,"qty":1197}},{{"row":0,"col":1,"qty":607}},...]'
     )
 
-    response = None
-    for attempt in range(_GEMINI_TRANSIENT_RETRIES + 1):
-        try:
-            response = client.models.generate_content(
-                model=_GEMINI_MODEL,
-                contents=[pil, prompt],
-            )
-            break  # success
-        except Exception as e:  # noqa: BLE001
-            err_str = str(e).lower()
-            # Quota / rate limit — back off for the rest of the day, no retry.
-            if any(s in err_str for s in ('429', 'quota', 'resource_exhausted', 'rate')):
-                _record_gemini_quota_error(e)
-                return None
-            # Transient server overload — retry with backoff before giving up.
-            is_transient = any(s in err_str for s in
-                               ('503', '500', 'unavailable', 'overloaded', 'internal'))
-            if is_transient and attempt < _GEMINI_TRANSIENT_RETRIES:
-                delay = _GEMINI_RETRY_BACKOFF * (2 ** attempt)
-                print(f'[gemini] transient error (attempt {attempt + 1}/'
-                      f'{_GEMINI_TRANSIENT_RETRIES + 1}), retrying in {delay:.0f}s: {e}')
-                time.sleep(delay)
-                continue
-            # Non-transient error, or retries exhausted — fall back to Florence-2.
-            print(f'[gemini] error, falling back to Florence-2: {e}')
-            return None
 
-    if response is None:
-        return None
-
-    text = (response.text or '').strip()
+def _parse_qty_json(text: str, model: str) -> Optional[Dict[Tuple[int, int], int]]:
+    """Parse Gemini's JSON array response into a {(row,col): qty} dict, or None."""
+    text = (text or '').strip()
     if text.startswith('```'):
         text = re.sub(r'^```(?:json)?\s*', '', text)
         text = re.sub(r'\s*```$', '', text)
-
     try:
         parsed = json.loads(text)
     except (json.JSONDecodeError, ValueError) as e:
-        print(f'[gemini] non-JSON response, falling back: {e!r}; raw={text[:200]!r}')
+        print(f'[gemini] {model} non-JSON response: {e!r}; raw={text[:200]!r}')
         return None
-
     if not isinstance(parsed, list):
-        print(f'[gemini] expected list, got {type(parsed).__name__}; falling back')
+        print(f'[gemini] {model} expected list, got {type(parsed).__name__}')
         return None
-
     out: Dict[Tuple[int, int], int] = {}
     for item in parsed:
         try:
@@ -614,9 +436,73 @@ def _gemini_read_all_quantities(
             out[(r, c)] = q
         except (KeyError, TypeError, ValueError):
             continue
-
-    _gemini_state['success'] += 1
     return out
+
+
+def _try_gemini_model(client, model: str, pil, prompt: str, ms: dict
+                      ) -> Optional[Dict[Tuple[int, int], int]]:
+    """Try one model (with transient-error retries). Returns the qty dict on
+    success, or None to signal the caller should advance to the next model.
+    On 429 it marks this model exhausted for the rest of the day."""
+    response = None
+    for attempt in range(_GEMINI_TRANSIENT_RETRIES + 1):
+        try:
+            response = client.models.generate_content(model=model, contents=[pil, prompt])
+            break
+        except Exception as e:  # noqa: BLE001
+            err_str = str(e).lower()
+            # Quota / rate limit — this model is done for the day; advance chain.
+            if any(s in err_str for s in ('429', 'quota', 'resource_exhausted', 'rate')):
+                ms['adaptive_cap'] = ms['success']
+                print(f'[gemini] {model} quota hit at {ms["success"]} reqs — advancing chain')
+                return None
+            # Transient server overload — retry with backoff before advancing.
+            is_transient = any(s in err_str for s in
+                               ('503', '500', 'unavailable', 'overloaded', 'internal'))
+            if is_transient and attempt < _GEMINI_TRANSIENT_RETRIES:
+                delay = _GEMINI_RETRY_BACKOFF * (2 ** attempt)
+                print(f'[gemini] {model} transient error (attempt {attempt + 1}/'
+                      f'{_GEMINI_TRANSIENT_RETRIES + 1}), retrying in {delay:.0f}s: {e}')
+                time.sleep(delay)
+                continue
+            print(f'[gemini] {model} error: {e} — advancing chain')
+            return None
+
+    if response is None:
+        return None
+    out = _parse_qty_json(response.text, model)
+    if out is not None:
+        ms['success'] += 1
+    return out
+
+
+def _gemini_read_all_quantities(
+    grid_bgr: np.ndarray, rows: int, cols: int,
+) -> Optional[Dict[Tuple[int, int], int]]:
+    """Read every quantity in the grid via the Gemini model chain.
+
+    Tries each model in _GEMINI_MODEL_CHAIN in order, skipping any already at
+    its daily cap. Returns {(row, col): quantity} on the first success, or
+    ``None`` when the entire chain is unavailable/exhausted (callers then emit
+    quantity=0 + low confidence for manual entry).
+    """
+    client = _get_gemini_client()
+    if client is None:
+        return None
+    _reset_gemini_day_if_needed()
+
+    from PIL import Image
+    pil = Image.fromarray(cv2.cvtColor(grid_bgr, cv2.COLOR_BGR2RGB))
+    prompt = _build_qty_prompt(rows, cols)
+
+    for model, cap in _GEMINI_MODEL_CHAIN:
+        ms = _gemini_model_state(model, cap)
+        if ms['success'] >= ms['adaptive_cap']:
+            continue  # this model exhausted today — try the next
+        out = _try_gemini_model(client, model, pil, prompt, ms)
+        if out is not None:
+            return out
+    return None  # whole chain exhausted/failed
 
 
 def _lookup_or_read_quantity(
@@ -625,10 +511,13 @@ def _lookup_or_read_quantity(
     col: int,
     qty_lookup: Optional[Dict[Tuple[int, int], int]],
 ) -> Tuple[int, float]:
-    """Prefer Gemini's cached lookup; fall back to per-cell Florence-2."""
+    """Return the Gemini-read quantity for this cell. When the cell is missing
+    (entire Gemini chain exhausted/failed), return 0 with low confidence so the
+    FE flags it red for manual entry — icon detection still yields the right item.
+    """
     if qty_lookup is not None and (row, col) in qty_lookup:
         return qty_lookup[(row, col)], 0.95
-    return _read_quantity(slot_bgr)
+    return 0, -1.0  # sentinel: quantity unknown → _compute_confidence forces red
 
 
 def _match_template(image: np.ndarray, template_path: str, threshold: float = 0.7) -> Optional[Tuple[int, int, int, int]]:
@@ -1271,7 +1160,14 @@ def _extract_icon_crop(slot: np.ndarray) -> np.ndarray:
 
 
 def _compute_confidence(icon_score: float, digit_score: float) -> float:
-    """Blend icon and digit scores into a clamped confidence value."""
+    """Blend icon and digit scores into a clamped confidence value.
+
+    A negative digit_score is a sentinel meaning "quantity unknown" (Gemini
+    chain exhausted): force a red-zone confidence so the FE flags the cell for
+    manual entry regardless of how confident the icon match was.
+    """
+    if digit_score < 0:
+        return 0.2
     return max(0.0, min(1.0,
         _CONF_ICON_WEIGHT * icon_score + _CONF_DIGIT_WEIGHT * digit_score))
 
@@ -1313,8 +1209,8 @@ def _process_grid_cells(
 
     Two-pass design:
       Pass 1 — CLIP icon matching for every cell (fast, CPU-bound numpy).
-      Pass 2 — Quantity OCR via *qty_lookup* if provided (Gemini batch),
-               otherwise per-cell Florence-2.
+      Pass 2 — Quantity from *qty_lookup* (Gemini chain) if present; otherwise
+               quantity=0 with low confidence for manual entry.
     """
     results: List[Dict] = []
     icon_crops: List[np.ndarray] = []
@@ -1723,13 +1619,15 @@ def parse_inventory(image_bytes: bytes, inventory_type: str) -> List[Dict]:
     rarities = _load_rarities(inventory_type)
     shapes   = _load_shapes(inventory_type)
 
-    # Try Gemini batch OCR once on the whole grid. On success we get a
+    # Read all quantities once via the Gemini model chain. On success we get a
     # {(row, col): qty} lookup used by both _process_grid_cells and
-    # _recover_favor_items. On any failure (no key / quota / runtime error)
-    # this is None and both pass-throughs use per-cell Florence-2.
+    # _recover_favor_items. On total chain exhaustion this is None and both
+    # pass-throughs emit quantity=0 + low confidence for manual entry.
     qty_lookup = _gemini_read_all_quantities(grid, rows, cols)
     if qty_lookup is not None:
         print(f'[inventory_parser] Gemini OCR ok ({len(qty_lookup)} cells)')
+    else:
+        print('[inventory_parser] Gemini chain exhausted — quantities default to 0 for manual entry')
 
     results, icon_crops = _process_grid_cells(
         grid, rows, cols, cell_w, row_bounds,

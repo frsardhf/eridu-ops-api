@@ -20,6 +20,9 @@ services/inventory_parser/cache/icons/
 # EasyOCR / HuggingFace caches (pulled at runtime)
 .cache/
 
+# Bond100 SQLite database (runtime data, not source)
+services/bond100/data/
+
 # Debug output
 services/inventory_parser/assets/debug_out/
 

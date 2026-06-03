@@ -1,0 +1,6 @@
+# Bond 100 Hall — lightweight SQLite-backed API. No ML deps (kept separate from
+# the inventory_parser service so it can run with multiple fast workers).
+flask
+flask-cors
+gunicorn
+python-dotenv

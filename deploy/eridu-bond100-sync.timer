@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Eridu Bond 100 wall sync
+
+[Timer]
+# Once a day at 06:00. arona's cache refreshes every 4h, so daily is plenty;
+# bump to e.g. OnCalendar=*-*-* 00/6:00:00 for 4x/day if you want fresher counts.
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

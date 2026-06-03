@@ -1,0 +1,18 @@
+[Unit]
+Description=Eridu Bond 100 wall sync (arona -> blob cache)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=eridu
+Group=eridu
+WorkingDirectory=/opt/eridu-ops-api/services/bond100
+Environment=PATH=/opt/eridu-ops-api/services/bond100/.venv/bin
+Environment=PYTHONUNBUFFERED=1
+# Same DB the API serves from (outside the code dir so git pull never touches it).
+Environment=BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite
+# ARONA_TOKEN ('<email>:<token>') lives in this file, VPS only, so the token
+# binds to the VPS IP. Leading "-" tolerates the file being absent.
+EnvironmentFile=-/opt/eridu-ops-api/.env
+ExecStart=/opt/eridu-ops-api/services/bond100/.venv/bin/python sync_arona.py

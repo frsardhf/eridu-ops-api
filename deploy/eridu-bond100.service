@@ -1,0 +1,23 @@
+[Unit]
+Description=Eridu Bond 100 Hall API
+After=network.target
+
+[Service]
+Type=simple
+User=eridu
+Group=eridu
+WorkingDirectory=/opt/eridu-ops-api/services/bond100
+Environment=PATH=/opt/eridu-ops-api/services/bond100/.venv/bin
+Environment=PYTHONUNBUFFERED=1
+# DB lives outside the code dir so `git pull` never touches user data.
+Environment=BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite
+# Optional .env at repo root (leading "-" tolerates it being absent).
+EnvironmentFile=-/opt/eridu-ops-api/.env
+ExecStart=/opt/eridu-ops-api/services/bond100/.venv/bin/gunicorn \
+    --config /opt/eridu-ops-api/services/bond100/gunicorn.conf.py \
+    app:app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,6 +1,6 @@
 # eridu-ops-api
 
-A single-endpoint REST API that reads **Blue Archive** inventory screenshots and returns a structured JSON list of detected items with quantities. Deployed at `api.eriduops.com` and called by the [eridu-ops](https://eriduops.com) frontend's Inventory Scanner feature.
+The backend for [eridu-ops](https://eriduops.com) at `api.eriduops.com` — two services behind one nginx: an **Inventory Scanner** that reads **Blue Archive** inventory screenshots into structured JSON of items + quantities, and the **Bond 100 Hall** (community bond-100 counts, sourced from arona.icu). Most of this README covers the scanner; the Hall is summarized at the [end](#bond-100-hall).
 
 ## What it does
 
@@ -47,7 +47,7 @@ A single-endpoint REST API that reads **Blue Archive** inventory screenshots and
 
 Quantity reading is now handled entirely by a **chain of free-tier Gemini models** — no self-hosted OCR. How we got here:
 
-- **EasyOCR / RapidOCR** (early): traditional detect-then-recognize. Decent accuracy but slow on CPU (~30s) and a heavy dependency.
+- **EasyOCR / RapidOCR** (early): traditional detect-then-recognize. Decent accuracy but slow on CPU (~30s) and a heavy dependency. OCR consolidated to Gemini; the Paddle/EasyOCR fork (`eridu-api-paddle`) is retired — classic OCR's strengths (offline/on-prem, pixel-exact boxes, high-volume cost) don't apply to game-UI screenshots, where hosted VLMs read stylized fonts better.
 - **Florence-2** (removed): Microsoft's VLM. Accurate (~99%) but **~4 min per screenshot on the VPS CPU** — too slow to be a usable fallback. The only way to make it fast is a GPU/Mac Mini, at which point a hosted API is simpler and better.
 - **Gemini chain** (current): one API call sends the whole grid; the model returns every quantity in ~6s at ~100% digit accuracy. Models are tried in order — `3.1-flash-lite` (500 RPD) → `2.5-flash` → `3.5-flash` → `2.5-flash-lite`. Free-tier rate limits are **per-model**, so chaining sums to ~544 requests/day. Each model has its own daily counter (reset at Pacific midnight, matching Google's RPD boundary) and advances to the next on a 429.
 
@@ -156,3 +156,19 @@ Rows are global across the batch: screenshot #1 → rows `0..3` (items) / `0..4`
 ```
 
 `confidence` is the CLIP cosine similarity score (0–1). Values below 0.8 are flagged as low confidence in the frontend.
+
+## Bond 100 Hall
+
+A second service (gunicorn `:5002`, same nginx) backing the `/hall` page on the frontend — a community wall of how many players have reached **Bond 100** with each student, by Global server.
+
+**Bridge model:** arona.icu is the single source of truth. A daily systemd timer runs `sync_arona.py`, which pulls arona's `rank_by_max_favor_user_info` endpoint in one call, aggregates the five Global servers into per-student counts + name lists, and caches them as JSON blobs in a small SQLite cache. The API just serves that cache — no scraping, no merge logic, no per-entry storage.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /bond100/summary` | wall counts per student (+ by-server, snapshot date) |
+| `GET /bond100/students/<id>/entries` | player names at bond 100 for one student |
+| `POST /bond100/submissions` | "add me" — triggers an arona `/refresh` for the given friend code (rate-limited); the player appears in the next sync |
+
+Removal is handled on arona's side (the frontend links to arona's guidelines). Friend codes are never stored — only a salted hash, for submission rate-limiting (per-code cooldown + global hourly cap). The arona API token (`ARONA_TOKEN`) and the daily sync are covered in [`deploy/README.md`](deploy/README.md).
+
+Key files: `services/bond100/{sync_arona,app,repository,arona_client,db}.py`, `schema.sql`.

@@ -90,8 +90,25 @@ sqlite3 /opt/eridu-ops-api/var/bond100.sqlite ".backup '/root/bond100-$(date +%F
 ```bash
 ssh root@<vps-ip>
 cd /opt/eridu-ops-api && git pull
-systemctl restart eridu-parser eridu-bond100   # bond100 DB in var/ is untouched
+chown -R eridu:eridu /opt/eridu-ops-api          # git pull as root leaves new files root-owned
+systemctl restart eridu-parser eridu-bond100     # bond100 cache in var/ is untouched
 ```
+
+The `chown` matters: a root-run `git pull` makes new files root-owned, which
+breaks the `eridu`-user services and venv creation (`Permission denied` on
+`.venv`). Always re-chown after pulling.
+
+**If you re-install the nginx conf**, note `deploy/eridu-api.nginx.conf` is a bare
+`listen 80;` template — overwriting the live file wipes certbot's SSL (443) block,
+so HTTPS goes down until you re-run certbot to re-inject it:
+
+```bash
+install -m 644 deploy/eridu-api.nginx.conf /etc/nginx/sites-available/eridu-api
+sed -i 's/__DOMAIN__/api.eriduops.com/g' /etc/nginx/sites-available/eridu-api
+certbot --nginx -d api.eriduops.com --non-interactive --agree-tos -m frsardhafa@gmail.com --redirect
+```
+
+(Re-running `setup.sh` avoids this — it runs certbot right after installing the conf.)
 
 If `requirements.txt` changed:
 

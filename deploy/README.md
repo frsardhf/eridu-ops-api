@@ -110,11 +110,18 @@ certbot --nginx -d api.eriduops.com --non-interactive --agree-tos -m frsardhafa@
 
 (Re-running `setup.sh` avoids this — it runs certbot right after installing the conf.)
 
-If `requirements.txt` changed:
+If the parser's `requirements.txt` changed:
 
 ```bash
 sudo -u eridu bash -c "cd /opt/eridu-ops-api/services/inventory_parser && source .venv/bin/activate && pip install -r requirements.txt"
 systemctl restart eridu-parser
+```
+
+If the bond100 service's `requirements.txt` changed (separate venv):
+
+```bash
+sudo -u eridu bash -c "cd /opt/eridu-ops-api/services/bond100 && source .venv/bin/activate && pip install -r requirements.txt"
+systemctl restart eridu-bond100
 ```
 
 If new game items were added (re-fetch icons + rebuild embeddings):

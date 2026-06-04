@@ -64,14 +64,17 @@ The cap is **3, not higher**: a gating test showed multi-grid accuracy is 100% a
 | File | Purpose |
 |---|---|
 | `app.py` | Flask entrypoint — single route, CORS, model warmup |
-| `services/inventory_parser/pipeline.py` | 1500-line core engine: all detection, OCR, and correction logic |
+| `services/inventory_parser/pipeline.py` | ~1800-line core engine: all detection, OCR, and correction logic |
 | `services/inventory_parser/embed.py` | Offline tool: generates CLIP embeddings from icon PNGs, saves `.npy` cache |
+| `services/inventory_parser/embed_from_screenshots.py` | Quality booster: blends real in-game icon crops (from `assets/` screenshots whose pipeline output is monotonic = trusted) into the sprite embeddings |
 | `services/inventory_parser/download_icons.py` | Fetches icon images from SchaleDB |
 | `services/inventory_parser/test_gemini.py` | Smoke test for the Gemini fast path (single cell + full screenshot) |
+| `services/inventory_parser/batch_test.py` | Dev runner: parses every `assets/Screenshot*.png` and reports sort-order violations |
 | `cache/icon_embeddings_*.npy` | Precomputed 512-dim vectors — never committed to git, regenerated on deploy |
 | `deploy/setup.sh` | One-shot VPS installer (idempotent) |
-| `deploy/eridu-parser.service` | systemd unit file |
-| `deploy/eridu-api.nginx.conf` | Nginx reverse proxy + rate limiting config |
+| `deploy/eridu-parser.service` | Inventory parser systemd unit |
+| `deploy/eridu-bond100.service` | Bond 100 Hall systemd unit (paired with `eridu-bond100-sync.{service,timer}` for the daily refresh) |
+| `deploy/eridu-api.nginx.conf` | Nginx reverse proxy + rate limiting config (both services) |
 
 ## Local development
 
@@ -118,12 +121,13 @@ One-shot install on a fresh Ubuntu 24.04 VPS:
 curl -fsSL https://raw.githubusercontent.com/frsardhf/eridu-ops-api/master/deploy/setup.sh | bash
 ```
 
-Update after a code push:
+Update after a code push (see [`deploy/README.md`](deploy/README.md) for the full notes, including the certbot caveat when reinstalling the nginx conf):
 
 ```bash
 ssh root@<vps-ip>
 cd /opt/eridu-ops-api && git pull
-systemctl restart eridu-parser
+chown -R eridu:eridu /opt/eridu-ops-api          # git pull as root leaves new files root-owned
+systemctl restart eridu-parser eridu-bond100     # bond100 SQLite cache in var/ is untouched
 ```
 
 ## API reference

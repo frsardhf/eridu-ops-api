@@ -12,12 +12,15 @@ Abuse limits, in layers (FE limits are cosmetic; these are the real guards):
 """
 import hashlib
 import json
+import logging
 import os
 import re
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
 from db import get_connection
+
+log = logging.getLogger("bond100")
 
 REFRESH_URL = "https://api.arona.icu/api/friends/refresh"
 FRIEND_CODE_RE = re.compile(r"^[A-Za-z0-9]{4,20}$")
@@ -66,6 +69,7 @@ def _record(conn, code_hash: str, server: str) -> None:
 def _call_refresh(friend_code: str, timeout: int = 15) -> tuple[bool, str]:
     token = os.environ.get("ARONA_TOKEN")
     if not token:
+        log.error("arona /refresh skipped: ARONA_TOKEN not set")
         return False, "no_token"
     req = urllib.request.Request(
         REFRESH_URL,
@@ -77,17 +81,23 @@ def _call_refresh(friend_code: str, timeout: int = 15) -> tuple[bool, str]:
         with urllib.request.urlopen(req, timeout=timeout) as r:
             d = json.loads(r.read().decode("utf-8"))
     except Exception as e:  # noqa: BLE001 - network/parse errors all map to "try later"
+        log.warning("arona /refresh transport error: %s", type(e).__name__)
         return False, f"arona_error:{type(e).__name__}"
-    return (d.get("code") == 200), str(d.get("code"))
+    code = d.get("code")
+    if code != 200:
+        log.warning("arona /refresh non-success: code=%s message=%s", code, d.get("message"))
+    return (code == 200), str(code)
 
 
 def submit_refresh(server: str, friend_code: str) -> tuple[dict, int]:
     """Validate -> rate-limit -> call arona /refresh. Returns (json_body, http_status)."""
     code = (friend_code or "").strip()
     if not valid_friend_code(code):
+        log.info("submission rejected: invalid_friend_code server=%s", server)
         return {"ok": False, "error": "invalid_friend_code"}, 400
 
     code_hash = _code_hash(server, code)
+    ref = code_hash[:10]  # correlation id for logs — never the raw friend code
     conn = get_connection()
     try:
         allowed, reason = _check_rate(conn, code_hash)
@@ -95,13 +105,17 @@ def submit_refresh(server: str, friend_code: str) -> tuple[dict, int]:
             # A recent submission already queued this code — treat as success
             # (idempotent from the user's view), but spend no quota.
             if reason == "cooldown":
+                log.info("submission deduped (cooldown) server=%s ref=%s", server, ref)
                 return {"ok": True, "queued": False, "message": "already_submitted"}, 200
+            log.warning("submission rate_limited (global hourly cap) server=%s ref=%s", server, ref)
             return {"ok": False, "error": "rate_limited"}, 429
 
-        ok, _detail = _call_refresh(code)
+        ok, detail = _call_refresh(code)
         if not ok:
+            log.warning("submission refresh_failed server=%s ref=%s detail=%s", server, ref, detail)
             return {"ok": False, "error": "refresh_failed"}, 502
         _record(conn, code_hash, server)
+        log.info("submission queued server=%s ref=%s", server, ref)
     finally:
         conn.close()
     return {"ok": True, "queued": True}, 201

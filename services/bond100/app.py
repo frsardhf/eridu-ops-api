@@ -14,11 +14,19 @@ endpoint or moderation queue here.
     GET  /bond100/health
     POST /bond100/submissions
 """
+import logging
 import os
 
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
+
+# Submission outcomes (incl. arona /refresh failure reasons) log through the
+# "bond100" logger; INFO+ to stderr so journald captures it under the service.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 
 # Load .env from the repo root (two dirs up: services/bond100/app.py).
 _SERVICE_DIR = os.path.dirname(os.path.abspath(__file__))

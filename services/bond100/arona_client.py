@@ -7,7 +7,7 @@ the cooldown / rate-limit bookkeeping.
 Abuse limits, in layers (FE limits are cosmetic; these are the real guards):
   * nginx              -- per-IP request rate (edge; deploy/eridu-api.nginx.conf)
   * per-code cooldown  -- skip if this code was refreshed within arona's 4h cache
-  * global hourly cap  -- protect the shared arona quota / token
+  * global daily cap   -- stay under arona's ~60 req/day token budget (shared w/ sync)
   * format validation  -- reject junk friend codes before calling arona
 """
 import hashlib
@@ -25,7 +25,10 @@ log = logging.getLogger("bond100")
 REFRESH_URL = "https://api.arona.icu/api/friends/refresh"
 FRIEND_CODE_RE = re.compile(r"^[A-Za-z0-9]{4,20}$")
 COOLDOWN = timedelta(hours=6)       # > arona's 4h cache; sooner is wasted quota
-MAX_REFRESH_PER_HOUR = 60           # global cap across all users
+# arona's token allows only ~60 requests/DAY total, shared with the daily sync.
+# Cap submissions well under that so a busy day can't exhaust the quota and break
+# the 06:00 sync (which would 4003 and serve a stale wall).
+MAX_REFRESH_PER_DAY = 45
 
 
 def _now_iso() -> str:
@@ -48,11 +51,11 @@ def _check_rate(conn, code_hash: str) -> tuple[bool, str]:
     ).fetchone()
     if row and (now - datetime.fromisoformat(row["refreshed_at"])) < COOLDOWN:
         return False, "cooldown"
-    hour_ago = (now - timedelta(hours=1)).isoformat()
+    day_ago = (now - timedelta(hours=24)).isoformat()
     n = conn.execute(
-        "SELECT COUNT(*) AS c FROM bond100_refresh_log WHERE refreshed_at > ?", (hour_ago,)
+        "SELECT COUNT(*) AS c FROM bond100_refresh_log WHERE refreshed_at > ?", (day_ago,)
     ).fetchone()["c"]
-    if n >= MAX_REFRESH_PER_HOUR:
+    if n >= MAX_REFRESH_PER_DAY:
         return False, "global_rate"
     return True, ""
 
@@ -107,7 +110,7 @@ def submit_refresh(server: str, friend_code: str) -> tuple[dict, int]:
             if reason == "cooldown":
                 log.info("submission deduped (cooldown) server=%s ref=%s", server, ref)
                 return {"ok": True, "queued": False, "message": "already_submitted"}, 200
-            log.warning("submission rate_limited (global hourly cap) server=%s ref=%s", server, ref)
+            log.warning("submission rate_limited (global daily cap) server=%s ref=%s", server, ref)
             return {"ok": False, "error": "rate_limited"}, 429
 
         ok, detail = _call_refresh(code)

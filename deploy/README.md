@@ -68,11 +68,30 @@ systemctl list-timers eridu-bond100-sync.timer
 Local testing never needs the token: `python sync_arona.py --from-file <dump>`
 replays a saved response with no network call.
 
+### If the wall looks frozen
+
+The sync only rewrites the cache (and `snapshot_date`) when arona's wall
+actually changed; an identical payload logs `unchanged: ...; snapshot stays
+<date>` instead, so the frontend's snapshot date tracks real changes. arona's
+upstream ranking cache has frozen for a week+ before (2026-06 incident: a
+crash in their cache processor), so a stuck wall usually means arona is stuck,
+not our timer. To inspect what a sync would do without writing (costs one
+arona request):
+
+```bash
+cd /opt/eridu-ops-api/services/bond100
+sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; set +a; .venv/bin/python sync_arona.py --dry-run'
+```
+
+To pause ingestion entirely (e.g. arona warns their data is dirty until a
+cleanup lands): `systemctl disable --now eridu-bond100-sync.timer`; re-enable
+later with `systemctl enable --now eridu-bond100-sync.timer`.
+
 ### Submissions ("add me")
 
 `POST /bond100/submissions {serverRegion, friendCode}` triggers an arona
 `/refresh` for that account, so it appears in the next sync. It's rate-limited in
-three layers — nginx edge, a per-code 6h cooldown, and a global hourly cap — and
+three layers — nginx edge, a per-code 6h cooldown, and a global daily cap (45/day, under arona's ~60 req/day token budget shared with the sync) — and
 the friend code is never stored (only a salted hash for the cooldown). Removal is
 handled on arona's side; the frontend links out to arona's guidelines.
 

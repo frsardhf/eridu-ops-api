@@ -26,8 +26,8 @@ Removal is handled on arona's side; the frontend links out to arona's guidelines
 | File | Purpose |
 |---|---|
 | `app.py` | Flask entrypoint — 4 routes, CORS, no warmup |
-| `sync_arona.py` | Daily sync: pulls arona's user-info endpoint, aggregates global servers, writes the wall blobs to `bond100_meta` |
-| `arona_client.py` | `/refresh` client + abuse limiting (per-code 4h cooldown, global hourly cap, friend-code format validation) |
+| `sync_arona.py` | Daily sync: pulls arona's user-info endpoint, aggregates global servers, writes the wall blobs to `bond100_meta`. Skips the write and keeps `snapshot_date` when arona serves an identical wall, so the date tracks when data last actually changed; `--dry-run` previews a sync without writing |
+| `arona_client.py` | `/refresh` client + abuse limiting (per-code 6h cooldown — longer than arona's 4h refresh cache, plus a global daily cap of 45 to stay under arona's ~60 req/day token budget, and friend-code format validation) |
 | `repository.py` | Read helpers — `get_summary()` and `get_student_entries(id)` over the cached blobs |
 | `db.py` | SQLite connection (WAL mode), schema init, server regions, linked-student pair map |
 | `schema.sql` | Two tables: `bond100_meta` (cached wall) and `bond100_refresh_log` (cooldown ledger keyed by `sha256(server|friend_code)`) |

@@ -173,6 +173,6 @@ A second service (gunicorn `:5002`, same nginx) backing the `/hall` page on the 
 | `GET /bond100/students/<id>/entries` | player names at bond 100 for one student |
 | `POST /bond100/submissions` | "add me" — triggers an arona `/refresh` for the given friend code (rate-limited); the player appears in the next sync |
 
-Removal is handled on arona's side (the frontend links to arona's guidelines). Friend codes are never stored — only a salted hash, for submission rate-limiting (per-code cooldown + global hourly cap). The arona API token (`ARONA_TOKEN`) and the daily sync are covered in [`deploy/README.md`](deploy/README.md).
+Removal is handled on arona's side (the frontend links to arona's guidelines). Friend codes are never stored — only a salted hash, for submission rate-limiting (per-code 6h cooldown + global daily cap). The arona API token (`ARONA_TOKEN`) and the daily sync are covered in [`deploy/README.md`](deploy/README.md).
 
 Key files: `services/bond100/{sync_arona,app,repository,arona_client,db}.py`, `schema.sql`.

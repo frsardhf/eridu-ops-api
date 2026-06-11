@@ -6,10 +6,16 @@ JSON blobs in bond100_meta. No per-entry rows, no dedup, no moderation storage.
 
     python3 sync_arona.py --from-file userinfo_full_s9.json   # local, no network
     ARONA_TOKEN='<email>:<token>' python3 sync_arona.py        # live fetch
+    python3 sync_arona.py --dry-run                            # report, write nothing
 
 The endpoint's `server` param is ignored (it always returns the full cross-server
 cache, refreshed every 4h on arona's side), so we request once and filter to the
 five global servers ourselves.
+
+If arona serves a wall identical to what we already cached (its upstream ranking
+cache has frozen for a week+ before; 2026-06 incident), the sync skips the write
+and keeps snapshot_date, so the frontend reports when the data last actually
+changed rather than when we last fetched it.
 """
 import argparse
 import json
@@ -66,6 +72,48 @@ def aggregate(data: list) -> tuple[dict, dict]:
     return summary, entries_json
 
 
+def read_cache() -> tuple[dict | None, dict | None, str | None]:
+    """(wall_summary, entries, snapshot_date) currently cached; Nones when empty."""
+    init_db()
+    conn = get_connection()
+    try:
+        rows = {
+            r["key"]: r["value"]
+            for r in conn.execute(
+                "SELECT key, value FROM bond100_meta "
+                "WHERE key IN ('wall_summary', 'entries', 'snapshot_date')"
+            )
+        }
+    finally:
+        conn.close()
+    summary = json.loads(rows["wall_summary"]) if rows.get("wall_summary") else None
+    entries = json.loads(rows["entries"]) if rows.get("entries") else None
+    return summary, entries, rows.get("snapshot_date")
+
+
+def canonical_wall(summary: dict, entries: dict) -> str:
+    """Order-independent fingerprint of the wall. arona re-serves its cache in a
+    different list order run to run, so byte-comparing the blobs reports false
+    changes; normalize entry order and dict key order before comparing."""
+    norm_entries = {
+        sid: sorted((e["serverRegion"], e["playerName"]) for e in lst)
+        for sid, lst in entries.items()
+    }
+    return json.dumps({"summary": summary, "entries": norm_entries},
+                      ensure_ascii=False, sort_keys=True)
+
+
+def diff_counts(old_summary: dict | None, summary: dict) -> list[str]:
+    """Per-student count changes, for journald and --dry-run vetting."""
+    old = {s["studentId"]: s["count"] for s in (old_summary or {}).get("students", [])}
+    new = {s["studentId"]: s["count"] for s in summary["students"]}
+    return [
+        f"  student {sid}: {old.get(sid, 0)} -> {new.get(sid, 0)}"
+        for sid in sorted(old.keys() | new.keys())
+        if old.get(sid, 0) != new.get(sid, 0)
+    ]
+
+
 def write_cache(summary: dict, entries: dict, snapshot_date: str) -> None:
     init_db()
     conn = get_connection()
@@ -88,7 +136,10 @@ def write_cache(summary: dict, entries: dict, snapshot_date: str) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description="Sync the Bond 100 wall from arona's user-info endpoint.")
     ap.add_argument("--from-file", help="Read a saved userinfo dump instead of fetching (no network).")
-    ap.add_argument("--snapshot-date", default=date.today().isoformat(), help="Snapshot date YYYY-MM-DD.")
+    ap.add_argument("--snapshot-date", default=date.today().isoformat(),
+                    help="Snapshot date YYYY-MM-DD (only written when the wall actually changed).")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Fetch + aggregate + report what would change, but write nothing.")
     args = ap.parse_args()
 
     if args.from_file:
@@ -101,9 +152,36 @@ def main() -> None:
         sys.exit(f"unexpected response: code={d.get('code')} message={d.get('message')!r}")
 
     summary, entries = aggregate(d["data"])
+    old_summary, old_entries, old_snapshot = read_cache()
+    unchanged = (
+        old_summary is not None and old_entries is not None
+        and canonical_wall(summary, entries) == canonical_wall(old_summary, old_entries)
+    )
+    fetched = (f"total={summary['total']} students={len(summary['students'])} "
+               f"entry_lists={len(entries)}")
+
+    if args.dry_run:
+        cached = f"total={old_summary['total']} snapshot={old_snapshot}" if old_summary else "empty"
+        print(f"[dry-run] fetched: {fetched}")
+        print(f"[dry-run] cached:  {cached}")
+        if unchanged:
+            print(f"[dry-run] wall unchanged; a real run would keep snapshot_date={old_snapshot}")
+        else:
+            for line in diff_counts(old_summary, summary)[:40]:
+                print(f"[dry-run]{line}")
+            print(f"[dry-run] wall changed; a real run would write snapshot_date={args.snapshot_date}")
+        return
+
+    if unchanged:
+        # arona served the same wall again. Keep the old snapshot_date so the
+        # frontend shows when the data last actually changed, and journald gets
+        # an explicit staleness trail instead of a fake fresh sync.
+        print(f"unchanged: {fetched}; wall identical to cache, snapshot stays {old_snapshot}")
+        return
+
     write_cache(summary, entries, args.snapshot_date)
-    print(f"synced: total={summary['total']} students={len(summary['students'])} "
-          f"entry_lists={len(entries)} snapshot={args.snapshot_date}")
+    changed = len(diff_counts(old_summary, summary)) if old_summary else len(summary["students"])
+    print(f"synced: {fetched} snapshot={args.snapshot_date} changed_students={changed}")
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ import json
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -527,7 +528,6 @@ def _process_grid_cells_ncc(
     cell_w: float,
     row_bounds: List[int],
     inventory_type: str,
-    qty_lookup: Optional[Dict[Tuple[int, int], int]] = None,
 ) -> List[Dict]:
     """Classify every grid cell with the masked-NCC matcher.
 
@@ -536,6 +536,10 @@ def _process_grid_cells_ncc(
     (validated 250/250 on marked ground truth), and the old sort-order
     gap-filling heuristics could corrupt confident matches on sparsely-owned
     families. Low-margin cells are surfaced via confidence instead.
+
+    Quantities are merged later by _apply_quantities (so classification can
+    run while the Gemini call is in flight); until then each result carries
+    its match score/margin in temporary keys.
     """
     bank = ncc_matcher.get_bank(inventory_type, cell_w)
     results: List[Dict] = []
@@ -556,21 +560,34 @@ def _process_grid_cells_ncc(
                 continue  # empty slot (end of inventory)
 
             rarity, _ = _classify_rarity(slot)
-            quantity, digit_score = _lookup_or_read_quantity(slot, row, col, qty_lookup)
-            confidence = _compute_confidence(score, digit_score)
-            if margin < NCC_LOW_MARGIN or score < NCC_REVIEW_SCORE:
-                confidence = min(confidence, 0.5)
-
             results.append({
                 'row': row,
                 'col': col,
                 'itemId': item_id,
                 'rarity': rarity,
-                'quantity': int(quantity),
-                'confidence': round(confidence, 4),
+                '_score': score,
+                '_margin': margin,
             })
 
     return results
+
+
+def _apply_quantities(results: List[Dict],
+                      qty_lookup: Optional[Dict[Tuple[int, int], int]]) -> None:
+    """Merge Gemini quantities into classified results (in place) and turn
+    the temporary match score/margin into the final confidence."""
+    for r in results:
+        if qty_lookup is not None and (r['row'], r['col']) in qty_lookup:
+            quantity, digit_score = qty_lookup[(r['row'], r['col'])], 0.95
+        else:
+            quantity, digit_score = 0, -1.0   # unread → red for manual entry
+        score = r.pop('_score')
+        margin = r.pop('_margin')
+        confidence = _compute_confidence(score, digit_score)
+        if margin < NCC_LOW_MARGIN or score < NCC_REVIEW_SCORE:
+            confidence = min(confidence, 0.5)
+        r['quantity'] = int(quantity)
+        r['confidence'] = round(confidence, 4)
 
 
 # Tail-zone + sequence-break confidence demotion thresholds.
@@ -698,7 +715,8 @@ def _classify_and_correct(grid, rows, cols, cell_w, row_bounds,
     Callers offset the row index per screenshot when combining batches.
     """
     results = _process_grid_cells_ncc(
-        grid, rows, cols, cell_w, row_bounds, inventory_type, qty_lookup)
+        grid, rows, cols, cell_w, row_bounds, inventory_type)
+    _apply_quantities(results, qty_lookup)
     _demote_suspect_confidences(results, rows, cols)
     results.sort(key=lambda r: r['row'] * 5 + r['col'])
     return results
@@ -725,40 +743,24 @@ def parse_inventory_batch(images: List[bytes], inventory_type: str) -> List[Dict
     if not extracted:
         return []
 
-    # Build per-grid {(row,col): qty}. For >1 grid, one batched Gemini call;
-    # fall back to per-grid single calls on batch failure (handles the multi-grid
-    # prompt occasionally misbehaving, and transient errors) before degrading.
-    per_grid: List[Optional[Dict[Tuple[int, int], int]]]
-    # grid[:row_bounds[-1]] strips the NCC search pad below the last row so
-    # Gemini sees the same image it always has (in the scroll-extended case
-    # row_bounds[-1] is already the full grid height, so this is a no-op).
-    if len(extracted) > 1:
-        grids_for_gemini = [(g[:rb[-1]], r, c) for g, r, c, _, rb in extracted]
-        batched = _gemini_read_all_quantities_batched(grids_for_gemini)
-        if batched is not None:
-            print(f'[inventory_parser] Gemini batch OCR ok '
-                  f'({len(batched)} cells across {len(extracted)} grids)')
-            per_grid = [{} for _ in extracted]
-            for (gi, r, c), q in batched.items():
-                if 0 <= gi < len(extracted):
-                    per_grid[gi][(r, c)] = q
-        else:
-            print('[inventory_parser] batch OCR failed — retrying per-grid')
-            per_grid = [_gemini_read_all_quantities(g[:rb[-1]], r, c)
-                        for g, r, c, _, rb in extracted]
-    else:
-        g, r, c, _, rb = extracted[0]
-        single = _gemini_read_all_quantities(g[:rb[-1]], r, c)
-        if single is not None:
-            print(f'[inventory_parser] Gemini OCR ok ({len(single)} cells)')
-        else:
-            print('[inventory_parser] Gemini chain exhausted — quantities default to 0')
-        per_grid = [single]
+    # Quantities (network-bound Gemini chain) and icon classification
+    # (CPU-bound NCC) are independent until the final merge, so the Gemini
+    # call runs in a worker thread while the main thread classifies — the
+    # request takes max(gemini, ncc) instead of their sum.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        qty_future = pool.submit(_read_quantities, extracted)
+        classified = [
+            _process_grid_cells_ncc(grid, rows, cols, cell_w, row_bounds,
+                                    inventory_type)
+            for grid, rows, cols, cell_w, row_bounds in extracted
+        ]
+        per_grid = qty_future.result()
 
     combined: List[Dict] = []
     for gi, (grid, rows, cols, cell_w, row_bounds) in enumerate(extracted):
-        res = _classify_and_correct(grid, rows, cols, cell_w, row_bounds,
-                                    inventory_type, per_grid[gi])
+        res = classified[gi]
+        _apply_quantities(res, per_grid[gi])
+        _demote_suspect_confidences(res, rows, cols)
         offset = gi * rows_per
         for r in res:
             r['row'] += offset
@@ -766,6 +768,40 @@ def parse_inventory_batch(images: List[bytes], inventory_type: str) -> List[Dict
 
     combined.sort(key=lambda r: r['row'] * 5 + r['col'])
     return combined
+
+
+def _read_quantities(extracted) -> List[Optional[Dict[Tuple[int, int], int]]]:
+    """Per-grid {(row,col): qty} via the Gemini chain. For >1 grid, one
+    batched call; on batch failure each grid is retried individually before
+    degrading to None (quantity=0 + red confidence downstream).
+
+    grid[:row_bounds[-1]] strips the NCC search pad below the last row so
+    Gemini sees the same image it always has (in the scroll-extended case
+    row_bounds[-1] is already the full grid height, so this is a no-op).
+    """
+    if len(extracted) > 1:
+        grids_for_gemini = [(g[:rb[-1]], r, c) for g, r, c, _, rb in extracted]
+        batched = _gemini_read_all_quantities_batched(grids_for_gemini)
+        if batched is not None:
+            print(f'[inventory_parser] Gemini batch OCR ok '
+                  f'({len(batched)} cells across {len(extracted)} grids)')
+            per_grid: List[Optional[Dict[Tuple[int, int], int]]] = \
+                [{} for _ in extracted]
+            for (gi, r, c), q in batched.items():
+                if 0 <= gi < len(extracted):
+                    per_grid[gi][(r, c)] = q
+            return per_grid
+        print('[inventory_parser] batch OCR failed — retrying per-grid')
+        return [_gemini_read_all_quantities(g[:rb[-1]], r, c)
+                for g, r, c, _, rb in extracted]
+
+    g, r, c, _, rb = extracted[0]
+    single = _gemini_read_all_quantities(g[:rb[-1]], r, c)
+    if single is not None:
+        print(f'[inventory_parser] Gemini OCR ok ({len(single)} cells)')
+    else:
+        print('[inventory_parser] Gemini chain exhausted — quantities default to 0')
+    return [single]
 
 
 def parse_inventory(image_bytes: bytes, inventory_type: str) -> List[Dict]:

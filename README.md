@@ -20,9 +20,11 @@ The backend for [eridu-ops](https://eriduops.com) at `api.eriduops.com` — two 
          on batch failure, retries each grid individually before degrading)
   → Per grid, per-cell loop (5 cols × 4–5 rows):
       ① Rarity: HSV color of cell border ring (green=R, orange=SR, pink=SSR)
-      ② Icon ID: masked zero-mean template matching (TM_CCOEFF_NORMED) of every
-             SchaleDB sprite canvas against the cell, coarse-to-fine
-             (quarter-res all candidates → top-20 at half-res → top-5 full-res)
+      ② Icon ID: masked zero-mean template matching of every SchaleDB sprite
+             canvas against the cell, coarse-to-fine (quarter-res all
+             candidates → top-20 at half-res → top-5 full-res), each stage
+             one batched BLAS matmul (~10ms/cell; runs concurrently with ①③'s
+             Gemini call, so a request costs max(Gemini, matching))
       ③ Quantity: from the Gemini lookup; if the whole chain is exhausted → 0 + red confidence (manual entry)
   → Confidence demotion only (sort-order breaks / tail cells / low margin get
     flagged for review — IDs are never rewritten; the matcher scored 250/250
@@ -36,7 +38,7 @@ The backend for [eridu-ops](https://eriduops.com) at `api.eriduops.com` — two 
 |---|---|
 | Web server | Flask + Flask-CORS, Gunicorn, Nginx |
 | Image processing | OpenCV, NumPy |
-| Icon matching | Alpha-masked template matching (OpenCV `TM_CCOEFF_NORMED`, coarse-to-fine) vs SchaleDB sprites |
+| Icon matching | Alpha-masked zero-mean template matching vs SchaleDB sprites — coarse-to-fine, each stage a batched NumPy/BLAS matmul |
 | Quantity OCR | Gemini model chain (`google-genai`): one batched call reads all cells across 1–3 screenshots at once (~6s) |
 | Math helpers | SciPy (`uniform_filter1d` for row detection) |
 | Icon data | Sprite PNGs fetched from SchaleDB (`download_icons.py`) — used directly as match templates, no preprocessing step |
@@ -47,7 +49,8 @@ The backend for [eridu-ops](https://eriduops.com) at `api.eriduops.com` — two 
 Icon IDs are resolved by **alpha-masked zero-mean template matching** (`ncc_matcher.py`) — no ML model. How we got here:
 
 - **CLIP ViT-B/32 embeddings** (removed): cosine similarity against precomputed sprite embeddings, boosted by shape/rarity re-ranking and four ID-rewriting correction passes. The model's 32px patches wash out the small tier-pip/colour differences between sibling icons (e.g. Blu-ray vs tech-note tiers), so 57% of cells had a top1–top2 margin under 0.02 — near coin flips that the correction passes papered over. Measured on 250 hand-marked cells: raw CLIP 69.2%, CLIP+corrections 95.6%.
-- **Masked NCC** (current): the screenshot cell literally contains the SchaleDB sprite, so exact-pixel comparison is the right tool. Each 146×116 BGRA canvas slides over the cell window at calibrated scales with `TM_CCOEFF_NORMED`, scored only on sprite-opaque pixels (quantity-ribbon zone and equipment tier-badge zone masked out). Three-stage coarse-to-fine (quarter-res all candidates → top-20 half-res → top-5 full-res) keeps it at ~3s/screenshot. **250/250** on the same ground truth, worst-cell margin 0.015 (≈8× CLIP's median), plus 220/220 with zero sort violations on the regression set. Zero-mean matters: plain `TM_CCORR_NORMED` saturates on bright sprites and scored 46.8%.
+- **Masked NCC** (current): the screenshot cell literally contains the SchaleDB sprite, so exact-pixel comparison is the right tool. Each 146×116 BGRA canvas is scored against the cell window at calibrated scales with masked zero-mean correlation, on sprite-opaque pixels only (quantity-ribbon zone and equipment tier-badge zone masked out). Three-stage coarse-to-fine (quarter-res all candidates → top-20 half-res → top-5 full-res). **250/250** on the same ground truth, worst-cell margin 0.022, plus 220/220 with zero sort violations on the regression set. Zero-mean matters: plain `TM_CCORR_NORMED` saturates on bright sprites and scored 46.8%.
+- **GEMM batching** (speed): per-candidate `cv2.matchTemplate` calls cost ~2s/cell on a budget vCPU (~2min for a 3-screenshot request). Since `Σ M(P−p̄)(T−t̄)` reduces to `P·(M(T−t̄))` — the patch mean drops out — each stage scores all candidates × all positions with three BLAS matmuls over stacked templates: ~10ms/cell, same masks, same math (the quarter-res stage scores densely; its 1px-wide peaks made strided sampling misrank). Quantity OCR runs in a worker thread during matching, so a request costs max(Gemini, matching) instead of the sum. Sprites whose SchaleDB art drifted from the in-game render (JP cover text on EN clients: gifts 5009/5023) get hand-verified crops in `assets/icon_overrides/`, built by `debug_make_override.py`.
 
 The CLIP-era correction passes are retired with it (git history has the implementations). For the record, the ideas:
 

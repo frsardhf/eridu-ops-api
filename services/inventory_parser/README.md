@@ -16,7 +16,7 @@ The architecture (flow diagram, OCR chain, batching rationale, API contract) liv
 |---|---|
 | `app.py` | Flask entrypoint — single route, CORS, warmup |
 | `pipeline.py` | Core engine: grid detection, cell classification, Gemini OCR chain, confidence demotion |
-| `ncc_matcher.py` | Icon-ID matcher: coarse-to-fine alpha-masked template matching (`TM_CCOEFF_NORMED`) against the SchaleDB sprites — 250/250 on marked ground truth, no ML deps |
+| `ncc_matcher.py` | Icon-ID matcher: coarse-to-fine alpha-masked zero-mean template matching against the SchaleDB sprites, each stage a batched BLAS matmul (~10ms/cell) — 250/250 on marked ground truth, no ML deps. Prefers `assets/icon_overrides/` sprites when present |
 | `download_icons.py` | Fetches icon sprites from SchaleDB into `cache/icons/` — the matcher's reference data |
 | `test_gemini.py` | Smoke test for the Gemini quantity path |
 | `batch_test.py` | Dev runner: parses every `assets/Screenshot*.png` and reports sort-order violations |
@@ -24,6 +24,7 @@ The architecture (flow diagram, OCR chain, batching rationale, API contract) liv
 | `debug_detect_ids.py` | Detection-only dump (no Gemini) in ground-truth marking format, with NCC score/margin diag |
 | `debug_c2f_eval.py` | Scores the matcher against a hand-marked ground-truth txt |
 | `debug_ncc_eval.py` / `debug_ncc_probe.py` | Brute-force matcher eval / sprite scale calibration (for new devices/resolutions) |
+| `debug_make_override.py` | Builds an `assets/icon_overrides/` template from a verified in-game crop (for sprites whose SchaleDB art drifted from the render, e.g. JP cover art on EN clients — gifts 5009/5023) |
 | `gunicorn.conf.py` | `127.0.0.1:5001`, 1 worker, 300s timeout |
 | `requirements.txt` | Flask, OpenCV, NumPy, SciPy, Pillow, `google-genai` |
 | `cache/icon_index_*.json` + `cache/icons/` | SchaleDB sprite index + images (gitignored, fetched by `download_icons.py`) |

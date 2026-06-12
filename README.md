@@ -20,14 +20,13 @@ The backend for [eridu-ops](https://eriduops.com) at `api.eriduops.com` — two 
          on batch failure, retries each grid individually before degrading)
   → Per grid, per-cell loop (5 cols × 4–5 rows):
       ① Rarity: HSV color of cell border ring (green=R, orange=SR, pink=SSR)
-      ② Icon ID: CLIP ViT-B/32 embedding → cosine similarity vs ~90 precomputed embeddings
-             + shape re-ranking (circularity/aspect ratio) + rarity re-ranking
+      ② Icon ID: masked zero-mean template matching (TM_CCOEFF_NORMED) of every
+             SchaleDB sprite canvas against the cell, coarse-to-fine
+             (quarter-res all candidates → top-20 at half-res → top-5 full-res)
       ③ Quantity: from the Gemini lookup; if the whole chain is exhausted → 0 + red confidence (manual entry)
-  → Correction passes (per grid):
-      ① Sort-order constraint (enforce monotonic IDs per sort direction)
-      ② Range outlier fix (ID 3500 can't appear between IDs 200 and 210)
-      ③ Favor item recovery (SSR gifts at ID 5100+ are rare, re-scan for them)
-      ④ Group sort enforcement (within contiguous same-category runs)
+  → Confidence demotion only (sort-order breaks / tail cells / low margin get
+    flagged for review — IDs are never rewritten; the matcher scored 250/250
+    on marked ground truth where CLIP+correction passes scored 239/250)
   → Offset each grid's rows by grid_index × rows_per_screenshot → JSON response
 ```
 
@@ -37,11 +36,27 @@ The backend for [eridu-ops](https://eriduops.com) at `api.eriduops.com` — two 
 |---|---|
 | Web server | Flask + Flask-CORS, Gunicorn, Nginx |
 | Image processing | OpenCV, NumPy |
-| Icon matching | CLIP ViT-B/32 (Hugging Face Transformers + PyTorch), precomputed `.npy` embeddings |
+| Icon matching | Alpha-masked template matching (OpenCV `TM_CCOEFF_NORMED`, coarse-to-fine) vs SchaleDB sprites |
 | Quantity OCR | Gemini model chain (`google-genai`): one batched call reads all cells across 1–3 screenshots at once (~6s) |
 | Math helpers | SciPy (`uniform_filter1d` for row detection) |
-| Icon data | Fetched from SchaleDB (`download_icons.py`), embeddings precomputed offline by `embed.py` |
+| Icon data | Sprite PNGs fetched from SchaleDB (`download_icons.py`) — used directly as match templates, no preprocessing step |
 | Deployment | Ubuntu 24.04 VPS, Let's Encrypt SSL, systemd service |
+
+### Icon matching architecture decision
+
+Icon IDs are resolved by **alpha-masked zero-mean template matching** (`ncc_matcher.py`) — no ML model. How we got here:
+
+- **CLIP ViT-B/32 embeddings** (removed): cosine similarity against precomputed sprite embeddings, boosted by shape/rarity re-ranking and four ID-rewriting correction passes. The model's 32px patches wash out the small tier-pip/colour differences between sibling icons (e.g. Blu-ray vs tech-note tiers), so 57% of cells had a top1–top2 margin under 0.02 — near coin flips that the correction passes papered over. Measured on 250 hand-marked cells: raw CLIP 69.2%, CLIP+corrections 95.6%.
+- **Masked NCC** (current): the screenshot cell literally contains the SchaleDB sprite, so exact-pixel comparison is the right tool. Each 146×116 BGRA canvas slides over the cell window at calibrated scales with `TM_CCOEFF_NORMED`, scored only on sprite-opaque pixels (quantity-ribbon zone and equipment tier-badge zone masked out). Three-stage coarse-to-fine (quarter-res all candidates → top-20 half-res → top-5 full-res) keeps it at ~3s/screenshot. **250/250** on the same ground truth, worst-cell margin 0.015 (≈8× CLIP's median), plus 220/220 with zero sort violations on the regression set. Zero-mean matters: plain `TM_CCORR_NORMED` saturates on bright sprites and scored 46.8%.
+
+The CLIP-era correction passes are retired with it (git history has the implementations). For the record, the ideas:
+
+- *Sort-order constraint* — the game lists items in ID order, so an ID that breaks monotonicity between two consistent neighbours is replaced by the unique same-rarity item that fits the gap.
+- *Range-outlier fix* — an item whose coarse ID family disagrees with its neighbours' (e.g. a 4xxx between 3xxx) is re-matched restricted to the expected family.
+- *Favor recovery* — gift cells dropped by the score threshold are re-scanned against the gift family only, at a relaxed threshold.
+- *Group sort enforcement* — within a contiguous same-family run, violating positions are re-matched restricted to the `(prev_id, next_id)` ID window.
+
+What survives is the **demote-only** variant: sort-order breaks, low match scores, and near-tie margins lower a cell's confidence so the frontend flags it for review, but never rewrite the ID — gap-filling on sparsely-owned families (gifts) once "corrected" a right answer into a wrong one.
 
 ### OCR architecture decision
 
@@ -51,7 +66,7 @@ Quantity reading is now handled entirely by a **chain of free-tier Gemini models
 - **Florence-2** (removed): Microsoft's VLM. Accurate (~99%) but **~4 min per screenshot on the VPS CPU** — too slow to be a usable fallback. The only way to make it fast is a GPU/Mac Mini, at which point a hosted API is simpler and better.
 - **Gemini chain** (current): one API call sends the whole grid; the model returns every quantity in ~6s at ~100% digit accuracy. Models are tried in order — `3.1-flash-lite` (500 RPD) → `2.5-flash` → `3.5-flash` → `2.5-flash-lite`. Free-tier rate limits are **per-model**, so chaining sums to ~544 requests/day. Each model has its own daily counter (reset at Pacific midnight, matching Google's RPD boundary) and advances to the next on a 429.
 
-**Direction:** Gemini-only, no offline fallback. When the entire chain is exhausted, cells return `quantity=0` with low (red) confidence so the user types the numbers manually — icon detection (local CLIP) still resolves the correct items. A fast result with a few blanks beats a 4-minute Florence wait. This also drops `timm`/`einops` and the heavy Florence weights from the deploy.
+**Direction:** Gemini-only, no offline fallback. When the entire chain is exhausted, cells return `quantity=0` with low (red) confidence so the user types the numbers manually — icon detection (local template matching) still resolves the correct items. A fast result with a few blanks beats a 4-minute Florence wait. This also drops `timm`/`einops` and the heavy Florence weights from the deploy.
 
 ### Batching (1–3 screenshots per request)
 
@@ -63,14 +78,13 @@ The cap is **3, not higher**: a gating test showed multi-grid accuracy is 100% a
 
 | File | Purpose |
 |---|---|
-| `app.py` | Flask entrypoint — single route, CORS, model warmup |
-| `services/inventory_parser/pipeline.py` | ~1800-line core engine: all detection, OCR, and correction logic |
-| `services/inventory_parser/embed.py` | Offline tool: generates CLIP embeddings from icon PNGs, saves `.npy` cache |
-| `services/inventory_parser/embed_from_screenshots.py` | Quality booster: blends real in-game icon crops (from `assets/` screenshots whose pipeline output is monotonic = trusted) into the sprite embeddings |
-| `services/inventory_parser/download_icons.py` | Fetches icon images from SchaleDB |
+| `app.py` | Flask entrypoint — single route, CORS, warmup |
+| `services/inventory_parser/pipeline.py` | Core engine: grid detection, cell classification, Gemini OCR chain, confidence demotion |
+| `services/inventory_parser/ncc_matcher.py` | Coarse-to-fine masked template matcher — the icon-ID backend (no ML deps) |
+| `services/inventory_parser/download_icons.py` | Fetches icon sprites from SchaleDB — the matcher's reference data |
 | `services/inventory_parser/test_gemini.py` | Smoke test for the Gemini fast path (single cell + full screenshot) |
 | `services/inventory_parser/batch_test.py` | Dev runner: parses every `assets/Screenshot*.png` and reports sort-order violations |
-| `cache/icon_embeddings_*.npy` | Precomputed 512-dim vectors — never committed to git, regenerated on deploy |
+| `cache/icons/` + `cache/icon_index_*.json` | SchaleDB sprites + index — never committed to git, fetched on deploy |
 | `deploy/setup.sh` | One-shot VPS installer (idempotent) |
 | `deploy/eridu-parser.service` | Inventory parser systemd unit |
 | `deploy/eridu-bond100.service` | Bond 100 Hall systemd unit (paired with `eridu-bond100-sync.{service,timer}` for the daily refresh) |
@@ -83,10 +97,8 @@ cd services/inventory_parser
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# First-time: fetch icons and build CLIP embeddings (~10 min, downloads ~600 MB)
+# First-time: fetch icon sprites (the matcher's reference data, ~1 min)
 python download_icons.py
-python embed.py items
-python embed.py equipment
 
 # Gemini API key is required for quantity OCR (without it, quantities default to 0
 # for manual entry — icon detection still works). Get one from Google AI Studio.
@@ -159,7 +171,7 @@ Rows are global across the batch: screenshot #1 → rows `0..3` (items) / `0..4`
 }
 ```
 
-`confidence` is the CLIP cosine similarity score (0–1). Values below 0.8 are flagged as low confidence in the frontend.
+`confidence` blends the icon-match score with the quantity-read status (0–1). Cells with an unread quantity, a low match score, or a near-tie margin are pushed below the frontend's review threshold. Values below 0.8 are flagged as low confidence in the frontend.
 
 ## Bond 100 Hall
 

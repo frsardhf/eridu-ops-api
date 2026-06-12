@@ -79,31 +79,6 @@ sudo -u "$USER_NAME" bash -c "
   python download_icons.py
 "
 
-echo "==> Build CLIP embeddings (downloads ~600 MB on first run, ~5 min each)"
-sudo -u "$USER_NAME" bash -c "
-  set -e
-  cd '$SVC_DIR'
-  source .venv/bin/activate
-  python embed.py items
-  python embed.py equipment
-"
-
-echo "==> Warm Florence-2 OCR model (downloads ~900 MB, ~3 min)"
-sudo -u "$USER_NAME" bash -c "
-  set -e
-  cd '$SVC_DIR'
-  source .venv/bin/activate
-  python -c \"
-from transformers import AutoProcessor, AutoModelForCausalLM
-import torch
-print('Downloading Florence-2 processor...')
-AutoProcessor.from_pretrained('microsoft/Florence-2-base', trust_remote_code=True)
-print('Downloading Florence-2 model...')
-AutoModelForCausalLM.from_pretrained('microsoft/Florence-2-base', torch_dtype=torch.float32, trust_remote_code=True, attn_implementation='eager')
-print('Florence-2 ready.')
-\"
-"
-
 echo "==> Nginx site"
 install -m 644 "$APP_DIR/deploy/eridu-api.nginx.conf" /etc/nginx/sites-available/eridu-api
 sed -i "s/__DOMAIN__/$DOMAIN/g" /etc/nginx/sites-available/eridu-api

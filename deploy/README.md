@@ -12,7 +12,7 @@ Then on the VPS as root:
 curl -fsSL https://raw.githubusercontent.com/frsardhf/eridu-ops-api/master/deploy/setup.sh | bash
 ```
 
-Takes ~10 minutes (apt install ~2 min, pip install ~3 min, embed.py ×2 ~5 min).
+Takes ~5 minutes (apt install ~2 min, pip install ~2 min, icon fetch ~1 min).
 
 ## Environment overrides
 
@@ -143,11 +143,18 @@ sudo -u eridu bash -c "cd /opt/eridu-ops-api/services/bond100 && source .venv/bi
 systemctl restart eridu-bond100
 ```
 
-If new game items were added (re-fetch icons + rebuild embeddings):
+If new game items were added (re-fetch icon sprites — the matcher reads them directly, no rebuild step):
 
 ```bash
-sudo -u eridu bash -c "cd /opt/eridu-ops-api/services/inventory_parser && source .venv/bin/activate && python download_icons.py && python embed.py items && python embed.py equipment"
+sudo -u eridu bash -c "cd /opt/eridu-ops-api/services/inventory_parser && source .venv/bin/activate && python download_icons.py"
 systemctl restart eridu-parser
+```
+
+One-time after the CLIP→template-matching migration, reclaim ~2 GB on the VPS (torch/transformers are no longer in `requirements.txt` but stay installed until removed):
+
+```bash
+sudo -u eridu bash -c "cd /opt/eridu-ops-api/services/inventory_parser && source .venv/bin/activate && pip uninstall -y torch transformers tokenizers safetensors huggingface-hub && rm -f cache/icon_embeddings_*"
+sudo -u eridu rm -rf ~eridu/.cache/huggingface
 ```
 
 ## Logs

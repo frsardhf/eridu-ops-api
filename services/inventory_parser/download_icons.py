@@ -1,6 +1,7 @@
 """Fetch item/equipment data from schaledb and build icon_index_*.json.
 
-Run before embed.py whenever new items are added to the game:
+Re-run whenever new items are added to the game (the matcher reads the
+sprites directly — no rebuild step afterwards, just restart the service):
 
     python download_icons.py items
     python download_icons.py equipment
@@ -8,7 +9,7 @@ Run before embed.py whenever new items are added to the game:
 
 Outputs written to cache/:
     icon_index_{type}.json            — {item_id: {filename, rarity}}
-    icons/{type}/{filename}.webp      — icon images (used by embed.py)
+    icons/{type}/{filename}.webp      — sprite images (the matcher's templates)
 """
 
 import json
@@ -158,7 +159,7 @@ def main() -> None:
             print(f'ERROR: unknown type "{t}". Use: items, equipment')
             sys.exit(1)
         download(t)
-    print('\nDone. Now run: python embed.py items && python embed.py equipment')
+    print('\nDone. Restart the service to pick up the new sprites.')
 
 
 if __name__ == '__main__':

@@ -4,10 +4,6 @@ gunicorn
 opencv-python-headless
 numpy
 scipy
-torch
-# transformers provides CLIPModel for icon matching. (Florence-2 removed, so the
-# old <5.0 pin it needed is gone — CLIP works on 4.x and 5.x alike.)
-transformers>=4.38.0
 Pillow
 protobuf
 # Gemini model chain is the sole quantity OCR path (3.1-flash-lite primary, with

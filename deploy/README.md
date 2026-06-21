@@ -80,8 +80,14 @@ arona request):
 
 ```bash
 cd /opt/eridu-ops-api/services/bond100
-sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; set +a; .venv/bin/python sync_arona.py --dry-run'
+sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sync_arona.py --dry-run'
 ```
+
+`BOND100_DB_PATH` is required: it lives in the systemd unit, not `.env`, so a
+plain shell run falls back to the dev `data/bond100.sqlite` and compares against
+the wrong (usually empty) cache, which makes every dry-run report "wall changed"
+no matter what arona returns. The sync now prints `cache db: <path>` so you can
+confirm it's pointed at `var/bond100.sqlite`.
 
 To pause ingestion entirely (e.g. arona warns their data is dirty until a
 cleanup lands): `systemctl disable --now eridu-bond100-sync.timer`; re-enable

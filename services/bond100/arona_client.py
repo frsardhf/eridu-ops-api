@@ -23,6 +23,11 @@ from db import get_connection
 log = logging.getLogger("bond100")
 
 REFRESH_URL = "https://api.arona.icu/api/friends/refresh"
+# arona groups servers coarsely for the friend interfaces: 1=China, 3=Japan,
+# 4=International (Asia/KR/NA/EU/TW). All Eridu users are Global, so refresh
+# always targets 4. arona made this `server` param required on /refresh in
+# 2026-06; omitting it gets the call rejected.
+INTL_SERVER = 4
 FRIEND_CODE_RE = re.compile(r"^[A-Za-z0-9]{4,20}$")
 COOLDOWN = timedelta(hours=6)       # > arona's 4h cache; sooner is wasted quota
 # arona's token allows only ~60 requests/DAY total, shared with the daily sync.
@@ -76,7 +81,7 @@ def _call_refresh(friend_code: str, timeout: int = 15) -> tuple[bool, str]:
         return False, "no_token"
     req = urllib.request.Request(
         REFRESH_URL,
-        data=json.dumps({"friend": friend_code, "assistType": 0}).encode(),
+        data=json.dumps({"friend": friend_code, "assistType": 0, "server": INTL_SERVER}).encode(),
         headers={"Content-Type": "application/json", "Authorization": f"ba-token {token}"},
         method="POST",
     )

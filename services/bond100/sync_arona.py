@@ -7,6 +7,7 @@ JSON blobs in bond100_meta. No per-entry rows, no dedup, no moderation storage.
     python3 sync_arona.py --from-file userinfo_full_s9.json   # local, no network
     ARONA_TOKEN='<email>:<token>' python3 sync_arona.py        # live fetch
     python3 sync_arona.py --dry-run                            # report, write nothing
+    python3 sync_arona.py --server 8                           # raw per-student counts for ONE server (cross-check vs arona.icu)
 
 The endpoint's `server` param is ignored (it always returns the full cross-server
 cache, refreshed every 4h on arona's side), so we request once and filter to the
@@ -25,7 +26,7 @@ import urllib.request
 from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from db import get_connection, init_db, primary_student_id  # noqa: E402
+from db import DB_PATH, get_connection, init_db, primary_student_id  # noqa: E402
 
 API_URL = "https://api.arona.icu/api/friends/rank_by_max_favor_user_info"
 GLOBAL_SERVERS = {5: "global_eu", 6: "global_tw", 7: "global_kr", 8: "global_asia", 9: "global_na"}
@@ -70,6 +71,39 @@ def aggregate(data: list) -> tuple[dict, dict]:
     summary = {"total": sum(s["count"] for s in students), "students": students}
     entries_json = {str(k): v for k, v in entries.items()}
     return summary, entries_json
+
+
+def inspect_server(data: list, server: int, student: int | None = None) -> None:
+    """Diagnostic: per-student bond-100 counts for ONE server, straight from
+    arona's payload. Unlike aggregate(), this does NOT collapse linked students
+    or drop blank-nickname players, so the numbers line up with what arona.icu
+    shows for that single server. Writes nothing; for cross-checking the _info
+    endpoint against the website when a server's counts look stuck."""
+    region = GLOBAL_SERVERS.get(server, f"server_{server}")
+    counts: dict[int, int] = {}
+    names: dict[int, list[str]] = {}
+    players = blank = 0
+    for p in data:
+        if p.get("server") != server:
+            continue
+        players += 1
+        nick = (p.get("nickname") or "").strip()
+        if not nick:
+            blank += 1
+        for sid in (p.get("studentIds") or []):
+            counts[sid] = counts.get(sid, 0) + 1
+            names.setdefault(sid, []).append(nick or "(no nickname)")
+
+    total = sum(counts.values())
+    print(f"server {server} ({region}): players={players} blank_nickname={blank} "
+          f"bond100_slots={total} students={len(counts)}")
+    if student is not None:
+        print(f"  student {student}: count={counts.get(student, 0)}")
+        for n in sorted(names.get(student, [])):
+            print(f"    {n}")
+        return
+    for sid in sorted(counts, key=lambda s: (-counts[s], s)):
+        print(f"  {sid}: {counts[sid]}")
 
 
 def read_cache() -> tuple[dict | None, dict | None, str | None]:
@@ -140,6 +174,12 @@ def main() -> None:
                     help="Snapshot date YYYY-MM-DD (only written when the wall actually changed).")
     ap.add_argument("--dry-run", action="store_true",
                     help="Fetch + aggregate + report what would change, but write nothing.")
+    ap.add_argument("--server", type=int,
+                    help="Diagnostic: print raw per-student bond-100 counts for ONE server id "
+                         "(e.g. 8 = global_asia) straight from arona, no aggregation/collapsing. "
+                         "Writes nothing. Pair with --student to list that student's player names.")
+    ap.add_argument("--student", type=int,
+                    help="With --server, list the player names at bond 100 for this student id.")
     args = ap.parse_args()
 
     if args.from_file:
@@ -151,19 +191,29 @@ def main() -> None:
     if d.get("code") != 200 or not isinstance(d.get("data"), list):
         sys.exit(f"unexpected response: code={d.get('code')} message={d.get('message')!r}")
 
+    if args.server is not None:
+        inspect_server(d["data"], args.server, args.student)
+        return
+
     summary, entries = aggregate(d["data"])
     old_summary, old_entries, old_snapshot = read_cache()
     unchanged = (
         old_summary is not None and old_entries is not None
         and canonical_wall(summary, entries) == canonical_wall(old_summary, old_entries)
     )
+    old_total = old_summary["total"] if old_summary else 0
     fetched = (f"total={summary['total']} students={len(summary['students'])} "
                f"entry_lists={len(entries)}")
+    # Always state which cache file this run reads/writes. Outside systemd,
+    # BOND100_DB_PATH is unset and this falls back to the dev data/ DB, so the
+    # comparison silently runs against the wrong (often empty) cache.
+    print(f"cache db: {DB_PATH}")
 
     if args.dry_run:
         cached = f"total={old_summary['total']} snapshot={old_snapshot}" if old_summary else "empty"
         print(f"[dry-run] fetched: {fetched}")
         print(f"[dry-run] cached:  {cached}")
+        print(f"[dry-run] total: {old_total} -> {summary['total']} (delta {summary['total'] - old_total:+d})")
         if unchanged:
             print(f"[dry-run] wall unchanged; a real run would keep snapshot_date={old_snapshot}")
         else:
@@ -176,12 +226,14 @@ def main() -> None:
         # arona served the same wall again. Keep the old snapshot_date so the
         # frontend shows when the data last actually changed, and journald gets
         # an explicit staleness trail instead of a fake fresh sync.
-        print(f"unchanged: {fetched}; wall identical to cache, snapshot stays {old_snapshot}")
+        print(f"unchanged: {fetched}; wall identical to cache "
+              f"(total stays {summary['total']}), snapshot stays {old_snapshot}")
         return
 
     write_cache(summary, entries, args.snapshot_date)
     changed = len(diff_counts(old_summary, summary)) if old_summary else len(summary["students"])
-    print(f"synced: {fetched} snapshot={args.snapshot_date} changed_students={changed}")
+    print(f"synced: {fetched} (total {old_total} -> {summary['total']}) "
+          f"snapshot={args.snapshot_date} changed_students={changed}")
 
 
 if __name__ == "__main__":

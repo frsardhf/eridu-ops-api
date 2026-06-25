@@ -110,9 +110,29 @@ sudo -u eridu bash -c 'BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite pyt
 sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --limit 3'
 ```
 
-The sweep writes rows only; it does **not** publish to the served wall yet (that
-assembly cutover is wired separately). Enable the daily timer when ready:
-`systemctl enable --now eridu-bond100-sweep.timer`.
+After fetching, the sweep **publishes**: it reassembles the served wall blobs
+(`wall_summary` + `entries`) from `bond100_student_rank`, so swept students appear
+on the Hall. Pass `--no-publish` to write rows without touching the served wall
+(validation only).
+
+#### Cutover (one-time): make the rolling sweep the wall's source
+
+The wall used to come straight from the `_info` sync; the sweep now owns it. To
+flip a VPS that's still serving the old `_info` blob:
+
+```bash
+cd /opt/eridu-ops-api/services/bond100
+# 1) publish the current table (208 seeded + any swept rows) to the served wall
+sudo -u eridu bash -c 'BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite python3 wall_store.py --commit'
+# 2) start the daily rolling refresh
+systemctl enable --now eridu-bond100-sweep.timer
+# 3) retire the _info sync (superseded; its direct blob writes would fight the
+#    assembled wall). The seed it produced already lives in the table.
+systemctl disable --now eridu-bond100-sync.timer
+```
+
+After this the wall is published by the sweep's assembly. The `_info` sync stays
+on disk as a manual re-seed/diagnostic tool but its timer is off.
 
 ### arona call budget (shared)
 

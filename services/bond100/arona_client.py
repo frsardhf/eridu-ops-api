@@ -7,7 +7,8 @@ the cooldown / rate-limit bookkeeping.
 Abuse limits, in layers (FE limits are cosmetic; these are the real guards):
   * nginx              -- per-IP request rate (edge; deploy/eridu-api.nginx.conf)
   * per-code cooldown  -- skip if this code was refreshed within arona's 4h cache
-  * global daily cap   -- stay under arona's ~60 req/day token budget (shared w/ sync)
+  * shared daily budget-- the bond100_api_log ledger (budget.py); /refresh shares
+                          arona's ~60/day token with the /rank sweep + _info sync
   * format validation  -- reject junk friend codes before calling arona
 """
 import hashlib
@@ -18,6 +19,7 @@ import re
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
+import budget
 from db import GLOBAL_SERVER_IDS, get_connection
 
 log = logging.getLogger("bond100")
@@ -32,10 +34,9 @@ REFRESH_URL = "https://api.arona.icu/api/friends/refresh"
 # rejected outright.
 FRIEND_CODE_RE = re.compile(r"^[A-Za-z0-9]{4,20}$")
 COOLDOWN = timedelta(hours=6)       # > arona's 4h cache; sooner is wasted quota
-# arona's token allows only ~60 requests/DAY total, shared with the daily sync.
-# Cap submissions well under that so a busy day can't exhaust the quota and break
-# the 06:00 sync (which would 4003 and serve a stale wall).
-MAX_REFRESH_PER_DAY = 45
+# The global daily cap now lives in the shared ledger (budget.py): /refresh is
+# allowed while the combined arona call count is under budget.CEILING, and the
+# sweep self-limits below that so submissions keep a reserved slice.
 
 
 def _now_iso() -> str:
@@ -51,18 +52,16 @@ def valid_friend_code(code) -> bool:
 
 
 def _check_rate(conn, code_hash: str) -> tuple[bool, str]:
-    """(allowed, reason). DB-backed so it's shared across gunicorn workers."""
+    """(allowed, reason). DB-backed so it's shared across gunicorn workers. The
+    per-code cooldown lives in bond100_refresh_log; the global daily cap is the
+    shared arona budget (counts every call kind, not just refreshes)."""
     now = datetime.now(timezone.utc)
     row = conn.execute(
         "SELECT refreshed_at FROM bond100_refresh_log WHERE code_hash = ?", (code_hash,)
     ).fetchone()
     if row and (now - datetime.fromisoformat(row["refreshed_at"])) < COOLDOWN:
         return False, "cooldown"
-    day_ago = (now - timedelta(hours=24)).isoformat()
-    n = conn.execute(
-        "SELECT COUNT(*) AS c FROM bond100_refresh_log WHERE refreshed_at > ?", (day_ago,)
-    ).fetchone()["c"]
-    if n >= MAX_REFRESH_PER_DAY:
+    if not budget.refresh_allowed(conn):
         return False, "global_rate"
     return True, ""
 
@@ -76,7 +75,7 @@ def _record(conn, code_hash: str, server: str) -> None:
     conn.commit()
 
 
-def _call_refresh(friend_code: str, server_id: int, timeout: int = 15) -> tuple[bool, str]:
+def _call_refresh(conn, friend_code: str, server_id: int, timeout: int = 15) -> tuple[bool, str]:
     token = os.environ.get("ARONA_TOKEN")
     if not token:
         log.error("arona /refresh skipped: ARONA_TOKEN not set")
@@ -93,6 +92,9 @@ def _call_refresh(friend_code: str, server_id: int, timeout: int = 15) -> tuple[
     except Exception as e:  # noqa: BLE001 - network/parse errors all map to "try later"
         log.warning("arona /refresh transport error: %s", type(e).__name__)
         return False, f"arona_error:{type(e).__name__}"
+    # The request reached arona and spent a token call (even on a non-200 code),
+    # so it counts against the shared daily budget.
+    budget.record_call(conn, "refresh")
     code = d.get("code")
     if code != 200:
         log.warning("arona /refresh non-success: code=%s message=%s", code, d.get("message"))
@@ -120,7 +122,7 @@ def submit_refresh(server: str, friend_code: str) -> tuple[dict, int]:
             log.warning("submission rate_limited (global daily cap) server=%s ref=%s", server, ref)
             return {"ok": False, "error": "rate_limited"}, 429
 
-        ok, detail = _call_refresh(code, GLOBAL_SERVER_IDS[server])
+        ok, detail = _call_refresh(conn, code, GLOBAL_SERVER_IDS[server])
         if not ok:
             log.warning("submission refresh_failed server=%s ref=%s detail=%s", server, ref, detail)
             return {"ok": False, "error": "refresh_failed"}, 502

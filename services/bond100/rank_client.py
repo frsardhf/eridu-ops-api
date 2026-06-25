@@ -94,9 +94,9 @@ def _page_dipped(records: list, target_ids: set) -> bool:
     return last is not None and (last.get("favorRank") or 0) < TARGET_BOND
 
 
-def _fetch_one_id(student_id: int, target_ids: set, token: str) -> tuple[dict, int | None]:
+def _fetch_one_id(student_id: int, target_ids: set, token: str) -> tuple[dict, int | None, int]:
     """All bond-100 entries for a single studentId, paginating until the bond-100
-    prefix ends. Returns ({key: entry}, extension)."""
+    prefix ends. Returns ({key: entry}, extension, pages_fetched)."""
     merged: dict[str, dict] = {}
     extension: int | None = None
     page = 1
@@ -109,16 +109,18 @@ def _fetch_one_id(student_id: int, target_ids: set, token: str) -> tuple[dict, i
         if data.get("lastPage") or _page_dipped(records, target_ids):
             break
         page += 1
-    return merged, extension
+    return merged, extension, page
 
 
-def fetch_student(student_id: int, token: str | None = None) -> tuple[int, list]:
+def fetch_student(student_id: int, token: str | None = None) -> tuple[int, list, int]:
     """Live bond-100 entries for a student (pass the PRIMARY id). Queries the
     primary plus any linked secondary ids and dedups players by `key`, so one
     player counts once for the unit even if they maxed both alt styles (this
     differs from _info, which double-counts such players). Returns
-    (count, entries) with entries = [{serverRegion, playerName}] sorted stably and
-    count == len(entries). Raises on a non-200 arona response."""
+    (count, entries, calls_made) with entries = [{serverRegion, playerName}]
+    sorted stably and count == len(entries). calls_made is the number of arona
+    requests issued, for the caller to record against the shared budget. Raises
+    on a non-200 arona response."""
     token = token or os.environ.get("ARONA_TOKEN")
     if not token:
         raise RuntimeError("ARONA_TOKEN required for a /rank fetch")
@@ -127,9 +129,11 @@ def fetch_student(student_id: int, token: str | None = None) -> tuple[int, list]
     target_ids = set(ids)
     merged: dict[str, dict] = {}
     ext_sum = 0
+    calls = 0
     for sid in ids:
-        per_id, extension = _fetch_one_id(sid, target_ids, token)
+        per_id, extension, pages = _fetch_one_id(sid, target_ids, token)
         merged.update(per_id)
+        calls += pages
         if isinstance(extension, int):
             ext_sum += extension
 
@@ -140,7 +144,7 @@ def fetch_student(student_id: int, token: str | None = None) -> tuple[int, list]
     # so only flag the unlinked mismatch, where it signals a parsing drift.
     if len(ids) == 1 and ext_sum and ext_sum != count:
         log.warning("rank %s: extension=%d but parsed %d bond-100 entries", student_id, ext_sum, count)
-    return count, entries
+    return count, entries, calls
 
 
 def main() -> None:
@@ -149,11 +153,11 @@ def main() -> None:
     ap.add_argument("--names", action="store_true", help="List player names, not just the per-server tally.")
     args = ap.parse_args()
 
-    count, entries = fetch_student(args.student)
+    count, entries, calls = fetch_student(args.student)
     by_region: dict[str, int] = {}
     for e in entries:
         by_region[e["serverRegion"]] = by_region.get(e["serverRegion"], 0) + 1
-    print(f"student {args.student}: bond100={count} byServer={by_region}")
+    print(f"student {args.student}: bond100={count} byServer={by_region} (arona calls: {calls})")
     if args.names:
         for e in entries:
             print(f"  {e['serverRegion']:>12}  {e['playerName']}")

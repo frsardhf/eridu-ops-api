@@ -44,6 +44,14 @@ def primary_student_id(student_id: int) -> int:
     return _SECONDARY_TO_PRIMARY.get(student_id, student_id)
 
 
+def linked_partner_ids(primary_id: int) -> list[int]:
+    """Secondary ids that collapse into this primary (e.g. [10099] for 10098).
+    The /rank sweep queries the primary AND its secondaries, since a player can
+    be bond-100 on either alt style; results merge under the primary, deduped by
+    player key so one player counts once for the unit."""
+    return [sec for sec, prim in _SECONDARY_TO_PRIMARY.items() if prim == primary_id]
+
+
 def get_connection() -> sqlite3.Connection:
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)

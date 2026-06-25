@@ -71,7 +71,7 @@ def order_stalest_first(conn, roster: list[int]) -> list[int]:
     return sorted(roster, key=lambda sid: (fetched.get(sid, ""), sid))
 
 
-def run_sweep(limit: int, dry_run: bool) -> None:
+def run_sweep(limit: int, dry_run: bool, publish: bool = True) -> None:
     init_db()
     token = os.environ.get("ARONA_TOKEN")
     if not token and not dry_run:
@@ -114,10 +114,16 @@ def run_sweep(limit: int, dry_run: bool) -> None:
                 changed += 1
                 print(f"  {sid}: {old if old is not None else '-'} -> {count}")
         print(f"sweep done: fetched {fetched} students ({changed} changed); "
-              f"budget now {budget.calls_in_window(conn)}/{budget.CEILING}. "
-              f"Run wall_store.py to publish (Phase 5 cutover).")
+              f"budget now {budget.calls_in_window(conn)}/{budget.CEILING}.")
     finally:
         conn.close()
+
+    # Publish: rebuild the served wall blobs from the table (swept + seeded rows).
+    # Skipped on a no-op run (nothing fetched) and when --no-publish is passed.
+    if publish and fetched > 0:
+        psummary, _ = wall_store.assemble_wall()
+        print(f"published: served wall total={psummary['total']} "
+              f"({len(psummary['students'])} students)")
 
 
 def main() -> None:
@@ -125,8 +131,10 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=budget.SWEEP_LIMIT,
                     help=f"Max students to fetch this run (default {budget.SWEEP_LIMIT}; also bounded by the shared budget).")
     ap.add_argument("--dry-run", action="store_true", help="Show roster + what would be fetched; write nothing, no calls.")
+    ap.add_argument("--no-publish", action="store_false", dest="publish",
+                    help="Fetch + write rows but do NOT rebuild the served wall (validation only).")
     args = ap.parse_args()
-    run_sweep(args.limit, args.dry_run)
+    run_sweep(args.limit, args.dry_run, args.publish)
 
 
 if __name__ == "__main__":

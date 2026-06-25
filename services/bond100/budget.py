@@ -24,12 +24,16 @@ SWEEP_LIMIT = CEILING - REFRESH_RESERVE   # 40: the sweep never pushes past this
 WINDOW_HOURS = 24      # rolling window (matches the /refresh cooldown bookkeeping)
 
 
-def record_call(conn, kind: str) -> None:
-    """Log one arona call. Commit immediately so concurrent gunicorn workers and
-    the sweep see an up-to-date count."""
-    conn.execute(
+def record_call(conn, kind: str, count: int = 1) -> None:
+    """Log `count` arona calls of one kind (a linked-pair /rank fetch spends 2).
+    Commit immediately so concurrent gunicorn workers and the sweep see an
+    up-to-date count."""
+    if count <= 0:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    conn.executemany(
         "INSERT INTO bond100_api_log (kind, called_at) VALUES (?, ?)",
-        (kind, datetime.now(timezone.utc).isoformat()),
+        [(kind, now)] * count,
     )
     conn.commit()
 

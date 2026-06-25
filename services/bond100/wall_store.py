@@ -148,9 +148,17 @@ def seed_from_info(default_fetched_at: str) -> int:
             return 0
         fetched = snapshot or default_fetched_at
         counts = {s["studentId"]: s["count"] for s in (summary or {}).get("students", [])}
+        # Never clobber a fresher /rank row with the stale _info seed: once the
+        # sweep has fetched a student, re-running the seed leaves it alone.
+        rank_rows = {
+            r["student_id"]
+            for r in conn.execute("SELECT student_id FROM bond100_student_rank WHERE source = 'rank'")
+        }
         seeded = 0
         for sid_str, ent_list in entries.items():
             sid = int(sid_str)
+            if sid in rank_rows:
+                continue
             upsert_student(conn, sid, counts.get(sid, len(ent_list)), ent_list, "info", fetched)
             seeded += 1
         conn.commit()

@@ -35,7 +35,7 @@ CREATE INDEX IF NOT EXISTS idx_student_rank_fetched ON bond100_student_rank (fet
 
 -- Abuse limiting for the submission ("add me") flow, which triggers an arona
 -- /refresh. code_hash = sha256(server|friend_code) — the raw friend code is
--- never stored. Used for the per-code cooldown + the global hourly cap.
+-- never stored. Used for the per-code cooldown.
 CREATE TABLE IF NOT EXISTS bond100_refresh_log (
   code_hash    TEXT PRIMARY KEY,
   server       TEXT,
@@ -43,3 +43,16 @@ CREATE TABLE IF NOT EXISTS bond100_refresh_log (
 );
 
 CREATE INDEX IF NOT EXISTS idx_refresh_at ON bond100_refresh_log (refreshed_at);
+
+
+-- Shared daily arona call ledger. arona's token allows ~60 calls/day across
+-- EVERY path that hits it: the submission /refresh flow, the rolling /rank
+-- sweep, and the daily _info sync. One row per call lets those paths share a
+-- single budget (see budget.py) so they can't collectively overrun the cap.
+CREATE TABLE IF NOT EXISTS bond100_api_log (
+  id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  kind      TEXT NOT NULL,     -- 'refresh' | 'rank' | 'info'
+  called_at TEXT NOT NULL      -- ISO8601 UTC
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_log_at ON bond100_api_log (called_at);

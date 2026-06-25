@@ -235,7 +235,8 @@ def main() -> None:
                    help="Seed the table + assemble in memory + confirm it matches the live wall. "
                         "Writes seed rows but NOT the served blobs.")
     g.add_argument("--commit", action="store_true",
-                   help="Seed the table, then assemble and write the served wall blobs.")
+                   help="Seed the _info baseline (missing/info rows), then assemble and publish the "
+                        "served wall blobs from the table (swept /rank rows included).")
     args = ap.parse_args()
 
     if args.verify:
@@ -243,11 +244,14 @@ def main() -> None:
         sys.exit(0 if ok else 1)
 
     if args.commit:
-        if not _verify(args.default_fetched_at):
-            sys.exit("commit aborted: verify did not match; refusing to overwrite the served wall.")
-        summary, entries = assemble_wall()
-        print(f"commit: wrote assembled wall (total={summary['total']} "
-              f"students={len(summary['students'])}) to bond100_meta.")
+        # No verify-gate: the assembled wall is SUPPOSED to diverge from the frozen
+        # _info wall once the sweep has fetched live /rank rows. Seed fills only the
+        # info baseline (never clobbers rank), then we publish the table as-is.
+        print(f"cache db: {DB_PATH}")
+        seeded = seed_from_info(args.default_fetched_at)
+        summary, _ = assemble_wall()
+        print(f"commit: seeded {seeded} info rows (rank rows kept); "
+              f"published wall total={summary['total']} students={len(summary['students'])}.")
 
 
 if __name__ == "__main__":

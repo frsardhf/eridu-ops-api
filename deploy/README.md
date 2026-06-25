@@ -126,13 +126,16 @@ cd /opt/eridu-ops-api/services/bond100
 sudo -u eridu bash -c 'BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite python3 wall_store.py --commit'
 # 2) start the daily rolling refresh
 systemctl enable --now eridu-bond100-sweep.timer
-# 3) retire the _info sync (superseded; its direct blob writes would fight the
-#    assembled wall). The seed it produced already lives in the table.
+# 3) retire the _info sync timer. _info is frozen + superseded by the sweep, and
+#    re-stamping its stale data daily would misrepresent the wall's freshness.
 systemctl disable --now eridu-bond100-sync.timer
 ```
 
-After this the wall is published by the sweep's assembly. The `_info` sync stays
-on disk as a manual re-seed/diagnostic tool but its timer is off.
+After this the wall is published by the sweep's assembly. `sync_arona.py` now
+also writes through the per-student table (source='info') and reassembles, never
+clobbering a fresher `/rank` row, so it's safe to run manually as a re-seed /
+diagnostic tool. Its timer stays off unless arona's `_info` cache un-freezes (a
+fast one-call baseline for all students); re-enable it then.
 
 ### arona call budget (shared)
 

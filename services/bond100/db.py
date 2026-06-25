@@ -16,6 +16,19 @@ SCHEMA_PATH = _DIR / "schema.sql"
 # Canonical server regions (matches the frontend Bond100ServerRegion union).
 SERVER_REGIONS = ("global_na", "global_eu", "global_asia", "global_tw", "global_kr")
 
+# arona's per-server ids, used both inside `_info` payloads and as the `server`
+# param for /refresh and /findRank. NOT the same as arona's friend-interface
+# "server group" docs (1=China, 3=Japan, 4=International) -- a live probe
+# against a real Global/Asia friend code returned 3009 (rejected) for group 4
+# and 200 (accepted) only for the specific id below. Keys match SERVER_REGIONS.
+GLOBAL_SERVER_IDS = {
+    "global_eu": 5,
+    "global_tw": 6,
+    "global_kr": 7,
+    "global_asia": 8,
+    "global_na": 9,
+}
+
 
 # Linked-student pairs (mirror of frontend linkedStudents.ts LINKED_STUDENT_PAIRS).
 # Some students exist as two SchaleDB ids for one in-game unit (e.g. Hoshino

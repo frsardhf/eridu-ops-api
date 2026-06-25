@@ -26,10 +26,10 @@ import urllib.request
 from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from db import DB_PATH, get_connection, init_db, primary_student_id  # noqa: E402
+from db import DB_PATH, GLOBAL_SERVER_IDS, get_connection, init_db, primary_student_id  # noqa: E402
 
 API_URL = "https://api.arona.icu/api/friends/rank_by_max_favor_user_info"
-GLOBAL_SERVERS = {5: "global_eu", 6: "global_tw", 7: "global_kr", 8: "global_asia", 9: "global_na"}
+GLOBAL_SERVERS = {v: k for k, v in GLOBAL_SERVER_IDS.items()}
 
 
 def fetch_live() -> dict:

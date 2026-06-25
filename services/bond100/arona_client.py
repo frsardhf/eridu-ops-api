@@ -18,16 +18,18 @@ import re
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-from db import get_connection
+from db import GLOBAL_SERVER_IDS, get_connection
 
 log = logging.getLogger("bond100")
 
 REFRESH_URL = "https://api.arona.icu/api/friends/refresh"
-# arona groups servers coarsely for the friend interfaces: 1=China, 3=Japan,
-# 4=International (Asia/KR/NA/EU/TW). All Eridu users are Global, so refresh
-# always targets 4. arona made this `server` param required on /refresh in
-# 2026-06; omitting it gets the call rejected.
-INTL_SERVER = 4
+# arona's docs describe a coarse "server group" for the friend interfaces
+# (1=China, 3=Japan, 4=International), but a live probe disproved it for a
+# real Global/Asia friend code: group 4 got 3009 (rejected), only the specific
+# per-server id (8, i.e. GLOBAL_SERVER_IDS["global_asia"]) got 200. So /refresh
+# wants the same per-server id as `_info` and /findRank, not the group value.
+# arona made `server` required on /refresh in 2026-06; omitting it gets
+# rejected outright.
 FRIEND_CODE_RE = re.compile(r"^[A-Za-z0-9]{4,20}$")
 COOLDOWN = timedelta(hours=6)       # > arona's 4h cache; sooner is wasted quota
 # arona's token allows only ~60 requests/DAY total, shared with the daily sync.
@@ -74,14 +76,14 @@ def _record(conn, code_hash: str, server: str) -> None:
     conn.commit()
 
 
-def _call_refresh(friend_code: str, timeout: int = 15) -> tuple[bool, str]:
+def _call_refresh(friend_code: str, server_id: int, timeout: int = 15) -> tuple[bool, str]:
     token = os.environ.get("ARONA_TOKEN")
     if not token:
         log.error("arona /refresh skipped: ARONA_TOKEN not set")
         return False, "no_token"
     req = urllib.request.Request(
         REFRESH_URL,
-        data=json.dumps({"friend": friend_code, "assistType": 0, "server": INTL_SERVER}).encode(),
+        data=json.dumps({"friend": friend_code, "assistType": 0, "server": server_id}).encode(),
         headers={"Content-Type": "application/json", "Authorization": f"ba-token {token}"},
         method="POST",
     )
@@ -118,7 +120,7 @@ def submit_refresh(server: str, friend_code: str) -> tuple[dict, int]:
             log.warning("submission rate_limited (global daily cap) server=%s ref=%s", server, ref)
             return {"ok": False, "error": "rate_limited"}, 429
 
-        ok, detail = _call_refresh(code)
+        ok, detail = _call_refresh(code, GLOBAL_SERVER_IDS[server])
         if not ok:
             log.warning("submission refresh_failed server=%s ref=%s detail=%s", server, ref, detail)
             return {"ok": False, "error": "refresh_failed"}, 502

@@ -18,7 +18,17 @@ import sys
 from datetime import date
 
 from db import DB_PATH, get_connection, init_db, primary_student_id
-from sync_arona import canonical_wall
+
+
+def canonical_wall(summary: dict, entries: dict) -> str:
+    """Order-independent fingerprint of the wall (summary + entries), used by
+    --verify to compare two walls regardless of list/key order."""
+    norm_entries = {
+        sid: sorted((e["serverRegion"], e["playerName"]) for e in lst)
+        for sid, lst in entries.items()
+    }
+    return json.dumps({"summary": summary, "entries": norm_entries},
+                      ensure_ascii=False, sort_keys=True)
 
 
 def upsert_student(conn, student_id: int, count: int, entries: list, source: str,
@@ -134,33 +144,39 @@ def assemble_wall() -> tuple[dict, dict]:
     return summary, entries
 
 
+def write_info_rows(conn, entries_by_student: dict, counts: dict, fetched_at: str) -> int:
+    """Upsert source='info' baseline rows from an _info aggregate, NEVER clobbering
+    a fresher 'rank' row (once the sweep has a student, _info leaves it alone).
+    entries_by_student: {str_id: [{serverRegion, playerName}]}; counts: {int_id: n}.
+    Caller commits. Returns the number of rows written."""
+    rank_rows = {
+        r["student_id"]
+        for r in conn.execute("SELECT student_id FROM bond100_student_rank WHERE source = 'rank'")
+    }
+    written = 0
+    for sid_str, ent_list in entries_by_student.items():
+        sid = int(sid_str)
+        if sid in rank_rows:
+            continue
+        upsert_student(conn, sid, counts.get(sid, len(ent_list)), ent_list, "info", fetched_at)
+        written += 1
+    return written
+
+
 def seed_from_info(default_fetched_at: str) -> int:
     """One-time: explode the current _info wall (bond100_meta blobs) into
     per-student rows so the served wall stays identical while the /rank sweep
     gradually overwrites rows. source='info'; fetched_at = the _info snapshot_date
     (or `default_fetched_at` if unset) so seeded rows sort as stalest and are
-    swept first. Idempotent (upsert); a later 'rank' row replaces its seed."""
+    swept first. Idempotent; a later 'rank' row is never clobbered."""
     init_db()
     conn = get_connection()
     try:
         summary, entries, snapshot = _read_blobs(conn)
         if entries is None:
             return 0
-        fetched = snapshot or default_fetched_at
         counts = {s["studentId"]: s["count"] for s in (summary or {}).get("students", [])}
-        # Never clobber a fresher /rank row with the stale _info seed: once the
-        # sweep has fetched a student, re-running the seed leaves it alone.
-        rank_rows = {
-            r["student_id"]
-            for r in conn.execute("SELECT student_id FROM bond100_student_rank WHERE source = 'rank'")
-        }
-        seeded = 0
-        for sid_str, ent_list in entries.items():
-            sid = int(sid_str)
-            if sid in rank_rows:
-                continue
-            upsert_student(conn, sid, counts.get(sid, len(ent_list)), ent_list, "info", fetched)
-            seeded += 1
+        seeded = write_info_rows(conn, entries, counts, snapshot or default_fetched_at)
         conn.commit()
     finally:
         conn.close()
@@ -191,9 +207,11 @@ def _verify(default_fetched_at: str) -> bool:
 
     print(f"verify: seeded {seeded} students; "
           f"live total={live_summary['total']} assembled total={assembled_summary['total']}")
-    # Compare on data only; the assembled wall carries fetchedAt the _info wall lacks.
+    # Compare on data only (counts/byServer/entries), ignoring per-student
+    # fetchedAt, which differs between the raw _info wall (none) and an already
+    # assembled wall (present) without meaning the data changed.
     if canonical_wall(_strip_freshness(assembled_summary), assembled_entries) == \
-            canonical_wall(live_summary, live_entries):
+            canonical_wall(_strip_freshness(live_summary), live_entries):
         print(f"verify: MATCH — assembled wall is identical to the live _info wall "
               f"(snapshot {snapshot}). Safe to --commit.")
         return True

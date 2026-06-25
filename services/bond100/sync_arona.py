@@ -1,8 +1,11 @@
-"""Bridge sync: pull arona's rank_by_max_favor_user_info, aggregate, cache.
+"""_info baseline sync: pull arona's rank_by_max_favor_user_info into the store.
 
-Bridge model: arona is the single source of truth. We make ONE call, aggregate
-the global servers into a wall summary + per-student entries, and cache both as
-JSON blobs in bond100_meta. No per-entry rows, no dedup, no moderation storage.
+The _info endpoint is one call for every student, but a DELAYED cache (it froze
+for 3+ weeks in the 2026-06 incident), so it's now the BASELINE, not the master:
+this sync writes its aggregate as source='info' rows in bond100_student_rank and
+reassembles the wall. The live /rank sweep (sweep_rank.py) overwrites those rows
+student-by-student, and write_info_rows NEVER clobbers a fresher 'rank' row, so a
+re-sync can't undo the sweep's real-time data.
 
     python3 sync_arona.py --from-file userinfo_full_s9.json   # local, no network
     ARONA_TOKEN='<email>:<token>' python3 sync_arona.py        # live fetch
@@ -10,13 +13,10 @@ JSON blobs in bond100_meta. No per-entry rows, no dedup, no moderation storage.
     python3 sync_arona.py --server 8                           # raw per-student counts for ONE server (cross-check vs arona.icu)
 
 The endpoint's `server` param is ignored (it always returns the full cross-server
-cache, refreshed every 4h on arona's side), so we request once and filter to the
-five global servers ourselves.
+cache), so we request once and filter to the five global servers ourselves.
 
-If arona serves a wall identical to what we already cached (its upstream ranking
-cache has frozen for a week+ before; 2026-06 incident), the sync skips the write
-and keeps snapshot_date, so the frontend reports when the data last actually
-changed rather than when we last fetched it.
+Post-cutover its systemd timer is disabled (the sweep owns the wall); this stays
+as a manual re-seed / diagnostic tool.
 """
 import argparse
 import json
@@ -26,6 +26,8 @@ import urllib.request
 from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import budget  # noqa: E402
+import wall_store  # noqa: E402
 from db import DB_PATH, GLOBAL_SERVER_IDS, get_connection, init_db, primary_student_id  # noqa: E402
 
 API_URL = "https://api.arona.icu/api/friends/rank_by_max_favor_user_info"
@@ -106,72 +108,11 @@ def inspect_server(data: list, server: int, student: int | None = None) -> None:
         print(f"  {sid}: {counts[sid]}")
 
 
-def read_cache() -> tuple[dict | None, dict | None, str | None]:
-    """(wall_summary, entries, snapshot_date) currently cached; Nones when empty."""
-    init_db()
-    conn = get_connection()
-    try:
-        rows = {
-            r["key"]: r["value"]
-            for r in conn.execute(
-                "SELECT key, value FROM bond100_meta "
-                "WHERE key IN ('wall_summary', 'entries', 'snapshot_date')"
-            )
-        }
-    finally:
-        conn.close()
-    summary = json.loads(rows["wall_summary"]) if rows.get("wall_summary") else None
-    entries = json.loads(rows["entries"]) if rows.get("entries") else None
-    return summary, entries, rows.get("snapshot_date")
-
-
-def canonical_wall(summary: dict, entries: dict) -> str:
-    """Order-independent fingerprint of the wall. arona re-serves its cache in a
-    different list order run to run, so byte-comparing the blobs reports false
-    changes; normalize entry order and dict key order before comparing."""
-    norm_entries = {
-        sid: sorted((e["serverRegion"], e["playerName"]) for e in lst)
-        for sid, lst in entries.items()
-    }
-    return json.dumps({"summary": summary, "entries": norm_entries},
-                      ensure_ascii=False, sort_keys=True)
-
-
-def diff_counts(old_summary: dict | None, summary: dict) -> list[str]:
-    """Per-student count changes, for journald and --dry-run vetting."""
-    old = {s["studentId"]: s["count"] for s in (old_summary or {}).get("students", [])}
-    new = {s["studentId"]: s["count"] for s in summary["students"]}
-    return [
-        f"  student {sid}: {old.get(sid, 0)} -> {new.get(sid, 0)}"
-        for sid in sorted(old.keys() | new.keys())
-        if old.get(sid, 0) != new.get(sid, 0)
-    ]
-
-
-def write_cache(summary: dict, entries: dict, snapshot_date: str) -> None:
-    init_db()
-    conn = get_connection()
-    try:
-        for key, value in (
-            ("wall_summary", json.dumps(summary, ensure_ascii=False, separators=(",", ":"))),
-            ("entries", json.dumps(entries, ensure_ascii=False, separators=(",", ":"))),
-            ("snapshot_date", snapshot_date),
-        ):
-            conn.execute(
-                "INSERT INTO bond100_meta (key, value) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (key, value),
-            )
-        conn.commit()
-    finally:
-        conn.close()
-
-
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Sync the Bond 100 wall from arona's user-info endpoint.")
+    ap = argparse.ArgumentParser(description="Refresh the Bond 100 _info baseline rows from arona's user-info endpoint.")
     ap.add_argument("--from-file", help="Read a saved userinfo dump instead of fetching (no network).")
     ap.add_argument("--snapshot-date", default=date.today().isoformat(),
-                    help="Snapshot date YYYY-MM-DD (only written when the wall actually changed).")
+                    help="fetched_at stamped on the _info baseline rows (YYYY-MM-DD).")
     ap.add_argument("--dry-run", action="store_true",
                     help="Fetch + aggregate + report what would change, but write nothing.")
     ap.add_argument("--server", type=int,
@@ -196,44 +137,37 @@ def main() -> None:
         return
 
     summary, entries = aggregate(d["data"])
-    old_summary, old_entries, old_snapshot = read_cache()
-    unchanged = (
-        old_summary is not None and old_entries is not None
-        and canonical_wall(summary, entries) == canonical_wall(old_summary, old_entries)
-    )
-    old_total = old_summary["total"] if old_summary else 0
+    counts = {s["studentId"]: s["count"] for s in summary["students"]}
     fetched = (f"total={summary['total']} students={len(summary['students'])} "
                f"entry_lists={len(entries)}")
     # Always state which cache file this run reads/writes. Outside systemd,
-    # BOND100_DB_PATH is unset and this falls back to the dev data/ DB, so the
-    # comparison silently runs against the wrong (often empty) cache.
+    # BOND100_DB_PATH is unset and this falls back to the dev data/ DB.
     print(f"cache db: {DB_PATH}")
 
-    if args.dry_run:
-        cached = f"total={old_summary['total']} snapshot={old_snapshot}" if old_summary else "empty"
-        print(f"[dry-run] fetched: {fetched}")
-        print(f"[dry-run] cached:  {cached}")
-        print(f"[dry-run] total: {old_total} -> {summary['total']} (delta {summary['total'] - old_total:+d})")
-        if unchanged:
-            print(f"[dry-run] wall unchanged; a real run would keep snapshot_date={old_snapshot}")
-        else:
-            for line in diff_counts(old_summary, summary)[:40]:
-                print(f"[dry-run]{line}")
-            print(f"[dry-run] wall changed; a real run would write snapshot_date={args.snapshot_date}")
-        return
+    init_db()
+    conn = get_connection()
+    try:
+        # A live fetch spent one arona call (even on a dry-run); record it.
+        if not args.from_file:
+            budget.record_call(conn, "info")
+        rank_held = conn.execute(
+            "SELECT COUNT(*) AS c FROM bond100_student_rank WHERE source = 'rank'"
+        ).fetchone()["c"]
 
-    if unchanged:
-        # arona served the same wall again. Keep the old snapshot_date so the
-        # frontend shows when the data last actually changed, and journald gets
-        # an explicit staleness trail instead of a fake fresh sync.
-        print(f"unchanged: {fetched}; wall identical to cache "
-              f"(total stays {summary['total']}), snapshot stays {old_snapshot}")
-        return
+        if args.dry_run:
+            print(f"[dry-run] fetched: {fetched}")
+            print(f"[dry-run] would refresh {len(entries) - min(rank_held, len(entries))}+ "
+                  f"info rows; {rank_held} fresher /rank rows kept untouched. Writes nothing.")
+            return
 
-    write_cache(summary, entries, args.snapshot_date)
-    changed = len(diff_counts(old_summary, summary)) if old_summary else len(summary["students"])
-    print(f"synced: {fetched} (total {old_total} -> {summary['total']}) "
-          f"snapshot={args.snapshot_date} changed_students={changed}")
+        written = wall_store.write_info_rows(conn, entries, counts, args.snapshot_date)
+        conn.commit()
+    finally:
+        conn.close()
+
+    pub, _ = wall_store.assemble_wall()
+    print(f"synced _info baseline: {fetched}; refreshed {written} info rows "
+          f"({rank_held} /rank rows kept); published wall total={pub['total']}")
 
 
 if __name__ == "__main__":

@@ -29,7 +29,7 @@ DOMAIN=api.example.com EMAIL=you@example.com bash setup.sh
 | Systemd unit | `/etc/systemd/system/eridu-parser.service` |
 | Bond100 venv | `/opt/eridu-ops-api/services/bond100/.venv` |
 | Bond100 cache | `/opt/eridu-ops-api/var/bond100.sqlite` (regenerable cache — survives `git pull`) |
-| Systemd units | `eridu-parser.service`, `eridu-bond100.service`, `eridu-bond100-sync.{service,timer}` |
+| Systemd units | `eridu-parser.service`, `eridu-bond100.service`, `eridu-bond100-sync.{service,timer}`, `eridu-bond100-sweep.{service,timer}` |
 | Nginx site | `/etc/nginx/sites-available/eridu-api` |
 | SSL cert | `/etc/letsencrypt/live/<DOMAIN>/` (auto-renews via certbot timer) |
 
@@ -93,13 +93,47 @@ To pause ingestion entirely (e.g. arona warns their data is dirty until a
 cleanup lands): `systemctl disable --now eridu-bond100-sync.timer`; re-enable
 later with `systemctl enable --now eridu-bond100-sync.timer`.
 
+### Rolling /rank sweep (live per-student counts)
+
+`_info` is one call for every student but a delayed cache (it froze for 3+ weeks
+in 2026-06). `friends/rank` is live but per-student, so `sweep_rank.py` refreshes
+the wall a slice at a time: each run fetches the stalest students (never-fetched
+first, so a newly released student `_info` missed is caught within a cycle),
+writing `bond100_student_rank` rows. At ~40 students/run the ~250 roster refreshes
+over ~6-7 days.
+
+```bash
+cd /opt/eridu-ops-api/services/bond100
+# dry-run: roster + what would be fetched, no arona calls
+sudo -u eridu bash -c 'BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite python3 sweep_rank.py --dry-run'
+# small live run (spends budget); omit --limit for a full ~40-student run
+sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --limit 3'
+```
+
+The sweep writes rows only; it does **not** publish to the served wall yet (that
+assembly cutover is wired separately). Enable the daily timer when ready:
+`systemctl enable --now eridu-bond100-sweep.timer`.
+
+### arona call budget (shared)
+
+Every path that hits arona, `/refresh` submissions, the `/rank` sweep, and the
+`_info` sync, shares arona's ~60/day token via one ledger (`bond100_api_log`).
+`budget.py` holds a `CEILING` of 55 (safety margin) and reserves 15 calls for
+user submissions, so the sweep self-limits to 40 and can never starve "add me".
+Check current usage:
+
+```bash
+sudo -u eridu bash -c 'BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite python3 budget.py'
+```
+
 ### Submissions ("add me")
 
 `POST /bond100/submissions {serverRegion, friendCode}` triggers an arona
 `/refresh` for that account, so it appears in the next sync. It's rate-limited in
-three layers — nginx edge, a per-code 6h cooldown, and a global daily cap (45/day, under arona's ~60 req/day token budget shared with the sync) — and
-the friend code is never stored (only a salted hash for the cooldown). Removal is
-handled on arona's side; the frontend links out to arona's guidelines.
+three layers — nginx edge, a per-code 6h cooldown, and the shared daily budget
+above (`/refresh` may use the full 55 ceiling; the ledger counts every call kind)
+— and the friend code is never stored (only a salted hash for the cooldown).
+Removal is handled on arona's side; the frontend links out to arona's guidelines.
 
 ### Backup
 

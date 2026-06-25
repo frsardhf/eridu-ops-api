@@ -1,0 +1,21 @@
+[Unit]
+Description=Eridu Bond 100 rolling /rank sweep (per-student live refresh)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=eridu
+Group=eridu
+WorkingDirectory=/opt/eridu-ops-api/services/bond100
+Environment=PATH=/opt/eridu-ops-api/services/bond100/.venv/bin
+Environment=PYTHONUNBUFFERED=1
+# Same DB the API serves from (outside the code dir so git pull never touches it).
+Environment=BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite
+# ARONA_TOKEN ('<email>:<token>') lives in this file, VPS only, so the token
+# binds to the VPS IP. Leading "-" tolerates the file being absent.
+EnvironmentFile=-/opt/eridu-ops-api/.env
+# Walks the stalest slice of the roster within the shared daily budget. Writes
+# bond100_student_rank rows only; publishing the wall is a separate step until
+# the Phase 5 cutover wires assembly in.
+ExecStart=/opt/eridu-ops-api/services/bond100/.venv/bin/python sweep_rank.py

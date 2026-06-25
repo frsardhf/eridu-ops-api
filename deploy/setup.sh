@@ -91,19 +91,29 @@ systemctl reload nginx
 echo "==> Systemd services"
 install -m 644 "$APP_DIR/deploy/eridu-parser.service" /etc/systemd/system/eridu-parser.service
 install -m 644 "$APP_DIR/deploy/eridu-bond100.service" /etc/systemd/system/eridu-bond100.service
-# Daily wall sync (pulls arona's user-info endpoint, aggregates, caches).
+# _info baseline sync (one arona call for all students; frozen/delayed cache).
 install -m 644 "$APP_DIR/deploy/eridu-bond100-sync.service" /etc/systemd/system/eridu-bond100-sync.service
 install -m 644 "$APP_DIR/deploy/eridu-bond100-sync.timer" /etc/systemd/system/eridu-bond100-sync.timer
+# Rolling /rank sweep (live per-student counts) — the wall's primary source.
+install -m 644 "$APP_DIR/deploy/eridu-bond100-sweep.service" /etc/systemd/system/eridu-bond100-sweep.service
+install -m 644 "$APP_DIR/deploy/eridu-bond100-sweep.timer" /etc/systemd/system/eridu-bond100-sweep.timer
 systemctl daemon-reload
 systemctl enable --now eridu-parser
 systemctl enable --now eridu-bond100
-systemctl enable --now eridu-bond100-sync.timer
+# The sweep owns the wall; enable its timer. The _info sync is the superseded
+# baseline (frozen upstream), so its timer stays OFF — re-enable only if arona
+# fixes _info. Both unit files are installed either way.
+systemctl enable --now eridu-bond100-sweep.timer
 
 # NOTE: the sync + submissions need ARONA_TOKEN ('<email>:<token>') in
 # /opt/eridu-ops-api/.env. The token binds to the first IP that calls arona, so
 # the first run MUST happen here on the VPS (its static IP), never from a laptop:
 #   echo 'ARONA_TOKEN=<email>:<token>' >> /opt/eridu-ops-api/.env
-#   systemctl start eridu-bond100-sync.service   # seeds the wall + binds the IP
+#   # bootstrap the table from _info once, then publish + let the sweep roll:
+#   sudo -u eridu BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite python3 \
+#     services/bond100/sync_arona.py        # seeds baseline rows + binds the IP
+#   sudo -u eridu BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite python3 \
+#     services/bond100/wall_store.py --commit   # publish the served wall
 
 echo "==> Firewall"
 ufw allow OpenSSH

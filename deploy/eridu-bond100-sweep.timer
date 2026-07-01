@@ -2,10 +2,10 @@
 Description=Daily Eridu Bond 100 rolling /rank sweep
 
 [Timer]
-# Once a day at 07:00, after the 06:00 _info sync. The shared budget (budget.py)
-# caps how many students one run fetches (~40), so the full ~250 roster refreshes
-# over ~6-7 days. Bump frequency only if you also raise the budget.
-OnCalendar=*-*-* 07:00:00
+# Once a day at 05:30 GMT+7. Pinned to Asia/Jakarta (UTC+7, no DST) so the VPS's
+# own timezone/DST can't shift it. The shared budget (budget.py) caps one run to
+# ~40 students, so the full ~250 roster refreshes over ~6-7 days.
+OnCalendar=*-*-* 05:30:00 Asia/Jakarta
 Persistent=true
 
 [Install]

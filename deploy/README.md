@@ -108,6 +108,9 @@ cd /opt/eridu-ops-api/services/bond100
 sudo -u eridu bash -c 'BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite python3 sweep_rank.py --dry-run'
 # small live run (spends budget); omit --limit for a full ~40-student run
 sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --limit 3'
+# force one (or more) specific students now: skips the roster + stalest ordering
+# + per-run limit, still records the call and republishes. Repeat --student per id.
+sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --student 10133'
 ```
 
 After fetching, the sweep **publishes**: it reassembles the served wall blobs

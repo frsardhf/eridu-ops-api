@@ -71,31 +71,46 @@ def order_stalest_first(conn, roster: list[int]) -> list[int]:
     return sorted(roster, key=lambda sid: (fetched.get(sid, ""), sid))
 
 
-def run_sweep(limit: int, dry_run: bool, publish: bool = True) -> None:
+def run_sweep(limit: int, dry_run: bool, publish: bool = True,
+              only_ids: list[int] | None = None) -> None:
     init_db()
     token = os.environ.get("ARONA_TOKEN")
     if not token and not dry_run:
         sys.exit("ARONA_TOKEN required for a live sweep")
 
-    roster = fetch_roster()
     conn = get_connection()
+    fetched = 0
     try:
-        order = order_stalest_first(conn, roster)
-        budget_left = budget.sweep_budget_left(conn)
-        print(f"roster: {len(roster)} global-released students; "
-              f"sweep budget left: {budget_left}; per-run limit: {limit}")
-
-        if dry_run:
-            n = min(limit, budget_left)
-            preview = order[:n]
-            print(f"[dry-run] would fetch {len(preview)} stalest: "
-                  f"{preview[:20]}{' ...' if len(preview) > 20 else ''}")
-            return
+        if only_ids:
+            # Targeted mode: fetch exactly these ids now, bypassing the roster
+            # (no SchaleDB call), the stalest ordering, and the per-run limit /
+            # sweep-budget gate. Still records the arona calls so the budget stays
+            # accurate. For a handful of deliberate ids.
+            order = [primary_student_id(s) for s in only_ids]
+            gated = False
+            print(f"targeted fetch: {order}; "
+                  f"budget now {budget.calls_in_window(conn)}/{budget.CEILING}")
+            if dry_run:
+                print(f"[dry-run] would fetch {order}; writes nothing, no calls.")
+                return
+        else:
+            roster = fetch_roster()
+            order = order_stalest_first(conn, roster)
+            gated = True
+            budget_left = budget.sweep_budget_left(conn)
+            print(f"roster: {len(roster)} global-released students; "
+                  f"sweep budget left: {budget_left}; per-run limit: {limit}")
+            if dry_run:
+                n = min(limit, budget_left)
+                preview = order[:n]
+                print(f"[dry-run] would fetch {len(preview)} stalest: "
+                      f"{preview[:20]}{' ...' if len(preview) > 20 else ''}")
+                return
 
         today = date.today().isoformat()
-        fetched = changed = 0
+        changed = 0
         for sid in order:
-            if fetched >= limit or budget.sweep_budget_left(conn) <= 0:
+            if gated and (fetched >= limit or budget.sweep_budget_left(conn) <= 0):
                 break
             try:
                 count, entries, calls = rank_client.fetch_student(sid, token)
@@ -112,6 +127,9 @@ def run_sweep(limit: int, dry_run: bool, publish: bool = True) -> None:
             fetched += 1
             if old != count:
                 changed += 1
+            # Roster sweep logs only changes (keeps 40-student runs quiet);
+            # targeted mode always shows the result.
+            if old != count or not gated:
                 print(f"  {sid}: {old if old is not None else '-'} -> {count}")
         print(f"sweep done: fetched {fetched} students ({changed} changed); "
               f"budget now {budget.calls_in_window(conn)}/{budget.CEILING}.")
@@ -133,8 +151,11 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true", help="Show roster + what would be fetched; write nothing, no calls.")
     ap.add_argument("--no-publish", action="store_false", dest="publish",
                     help="Fetch + write rows but do NOT rebuild the served wall (validation only).")
+    ap.add_argument("--student", type=int, action="append", metavar="ID",
+                    help="Fetch specific student id(s) now (repeatable), bypassing the roster, "
+                         "stalest ordering, and per-run limit. Still records the call + publishes.")
     args = ap.parse_args()
-    run_sweep(args.limit, args.dry_run, args.publish)
+    run_sweep(args.limit, args.dry_run, args.publish, only_ids=args.student)
 
 
 if __name__ == "__main__":

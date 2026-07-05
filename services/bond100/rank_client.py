@@ -30,7 +30,7 @@ import os
 import sys
 import urllib.request
 
-from db import GLOBAL_SERVER_IDS, linked_partner_ids
+from db import GLOBAL_SERVER_IDS, linked_partner_ids, primary_student_id
 
 log = logging.getLogger("bond100")
 
@@ -39,6 +39,7 @@ API_URL = "https://api.arona.icu/api/friends/rank"
 # db.GLOBAL_SERVER_IDS; records on any other server (China/Japan) are dropped.
 ID_TO_REGION = {v: k for k, v in GLOBAL_SERVER_IDS.items()}
 PAGE_SIZE = 200       # one page covers any student's bond-100 block (max << 200 today)
+GLOBAL_PAGE_SIZE = 50  # arona caps friends/rank at 50 records/page regardless of request
 TARGET_BOND = 100
 MAX_PAGES = 10        # safety net; a single page is the norm with size=200
 
@@ -145,6 +146,85 @@ def fetch_student(student_id: int, token: str | None = None) -> tuple[int, list,
     if len(ids) == 1 and ext_sum and ext_sum != count:
         log.warning("rank %s: extension=%d but parsed %d bond-100 entries", student_id, ext_sum, count)
     return count, entries, calls
+
+
+def _fetch_global_page(page: int, token: str, timeout: int = 30) -> dict:
+    """One page of the GLOBAL (no studentId) bond ranking, sorted bond-descending."""
+    req = urllib.request.Request(
+        API_URL,
+        data=json.dumps({"page": page, "size": GLOBAL_PAGE_SIZE, "server": 4}).encode(),
+        headers={"Content-Type": "application/json", "Authorization": f"ba-token {token}"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        body = json.loads(r.read().decode("utf-8"))
+    if body.get("code") != 200 or not isinstance(body.get("data"), dict):
+        raise RuntimeError(f"arona /rank (global) code={body.get('code')} message={body.get('message')!r}")
+    return body["data"]
+
+
+def fetch_all_bond100(token: str | None = None, max_calls: int = 200) -> tuple[list, int, int, bool]:
+    """Fetch the ENTIRE global bond-100 block from friends/rank (no studentId,
+    server=4), paging until favorRank drops below 100. Accumulates fully in memory
+    so a partial/failed fetch commits nothing.
+
+    Returns (records, extension, calls, complete):
+      records  = [{key, serverRegion, playerName, studentId}] bond-100 only, student
+                 collapsed to primary, deduped by (key, studentId).
+      extension= arona's reported bond-100 count (read from page 1).
+      calls    = arona requests issued.
+      complete = True only if the whole block was paged AND len(records)==extension.
+
+    If page 1 shows the block needs more than max_calls pages, it stops after page 1
+    (complete=False) so the caller can skip rather than spend a partial budget. Raises
+    on a non-200 arona response (caller commits nothing)."""
+    token = token or os.environ.get("ARONA_TOKEN")
+    if not token:
+        raise RuntimeError("ARONA_TOKEN required for a /rank fetch")
+
+    out: list = []
+    seen: set = set()
+
+    def collect(records: list) -> bool:
+        """Add bond-100 records; return True once a record drops below bond 100
+        (the sorted block has ended)."""
+        for rec in records:
+            assists = rec.get("assistInfoList") or []
+            assist = assists[0] if assists else None
+            fr = assist.get("favorRank") if assist else None
+            if fr is None:
+                continue
+            if fr < TARGET_BOND:
+                return True
+            region = ID_TO_REGION.get(rec.get("server"))
+            if region is None:
+                continue
+            name = (rec.get("nickname") or "").strip()
+            key = rec.get("key")
+            uid = assist.get("uniqueId")
+            if not name or not key or uid is None:
+                continue
+            sid = primary_student_id(uid)
+            if (key, sid) in seen:
+                continue
+            seen.add((key, sid))
+            out.append({"key": key, "serverRegion": region, "playerName": name, "studentId": sid})
+        return False
+
+    data = _fetch_global_page(1, token)
+    calls = 1
+    extension = data.get("extension") or 0
+    needed = -(-extension // GLOBAL_PAGE_SIZE) if extension else 1   # ceil(extension/50)
+    if needed > max_calls:
+        return out, extension, calls, False   # budget too low to finish; caller skips
+
+    dipped = collect(data.get("records") or [])
+    while not dipped and not data.get("lastPage") and calls < needed + 3:  # +3 slack for the boundary
+        calls += 1
+        data = _fetch_global_page(calls, token)
+        dipped = collect(data.get("records") or [])
+
+    return out, extension, calls, len(out) == extension
 
 
 def main() -> None:

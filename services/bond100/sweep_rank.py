@@ -146,6 +146,53 @@ def run_sweep(limit: int, dry_run: bool, publish: bool = True,
               f"({len(psummary['students'])} students)")
 
 
+def run_global(publish: bool = True) -> None:
+    """Full global bond-100 refresh: one /rank stream (no studentId) -> aggregate
+    per student -> ATOMICALLY replace the table -> publish. ~ceil(bond100/50) calls.
+
+    Atomic: the whole bond-100 block is fetched + validated (collected count ==
+    arona's `extension`) in memory before any DB write, and the replace runs in a
+    single transaction. A cut, failed, or budget-limited fetch commits nothing, so
+    the served wall is never left partial."""
+    init_db()
+    token = os.environ.get("ARONA_TOKEN")
+    if not token:
+        sys.exit("ARONA_TOKEN required for a global fetch")
+
+    conn = get_connection()
+    try:
+        budget_left = budget.sweep_budget_left(conn)
+        try:
+            records, extension, calls, complete = rank_client.fetch_all_bond100(token, max_calls=budget_left)
+        except Exception as e:  # noqa: BLE001 - network/parse; nothing written, retry next run
+            print(f"global fetch failed mid-stream: {e}; served wall unchanged.")
+            return
+        budget.record_call(conn, "rank", calls)
+        if not complete:
+            print(f"global fetch incomplete: collected {len(records)}/{extension} in {calls} calls "
+                  f"(sweep budget left was {budget_left}); served wall unchanged.")
+            conn.commit()
+            return
+
+        by_student: dict[int, list] = {}
+        for r in records:
+            by_student.setdefault(r["studentId"], []).append(
+                {"serverRegion": r["serverRegion"], "playerName": r["playerName"]})
+        today = date.today().isoformat()
+        conn.execute("DELETE FROM bond100_student_rank")
+        for sid, entries in by_student.items():
+            wall_store.upsert_student(conn, sid, len(entries), entries, "rank", today)
+        conn.commit()
+        print(f"global fetch: {len(records)} bond-100 across {len(by_student)} students in {calls} calls; "
+              f"budget now {budget.calls_in_window(conn)}/{budget.CEILING}")
+    finally:
+        conn.close()
+
+    if publish:
+        summary, _ = wall_store.assemble_wall()
+        print(f"published: served wall total={summary['total']} ({len(summary['students'])} students)")
+
+
 def report_store(limit: int) -> None:
     """Read-only: list the stalest students, split by whether they have bond-100
     entries. No arona calls, just the local store, for watching sweep coverage."""
@@ -196,9 +243,15 @@ def main() -> None:
     ap.add_argument("--report", action="store_true",
                     help="Read-only: list the stalest students split by entries / no entries "
                          "(rows shown per group capped by --limit). No arona calls.")
+    ap.add_argument("--global", dest="global_fetch", action="store_true",
+                    help="Full global bond-100 refresh via one /rank stream (no studentId): "
+                         "atomically replaces the whole wall. ~ceil(bond100/50) calls.")
     args = ap.parse_args()
     if args.report:
         report_store(args.limit)
+        return
+    if args.global_fetch:
+        run_global(args.publish)
         return
     run_sweep(args.limit, args.dry_run, args.publish, only_ids=args.student)
 

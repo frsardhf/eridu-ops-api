@@ -1,26 +1,28 @@
 """Shared daily arona call budget for the Bond 100 service.
 
 arona's token allows ~60 calls/day, shared by every path that hits arona: the
-submission /refresh flow, the rolling /rank sweep, and the daily _info sync. A
-single ledger (bond100_api_log) records each call so the paths can't collectively
-overrun the cap. Two guardrails:
+submission /refresh flow and the daily /rank sweep. A single ledger
+(bond100_api_log) records each call so the paths can't collectively overrun the
+cap. Two guardrails:
 
-  * CEILING (55) keeps a safety margin under arona's ~60.
-  * REFRESH_RESERVE (15) is held back for user-facing submissions, so a full
-    sweep can never starve "add me". The sweep self-limits to SWEEP_LIMIT (40);
+  * CEILING (58) keeps a small margin under arona's ~60.
+  * REFRESH_RESERVE (10) is held back for user-facing submissions, so a full
+    sweep can never starve "add me". The sweep self-limits to SWEEP_LIMIT (48);
     /refresh may use the whole ceiling.
 
-Observed submission volume is low single digits/day (see bond100_refresh_log), so
-the 15-call reserve comfortably covers real demand while the sweep takes the rest.
+SWEEP_LIMIT sized for the daily global fetch: ~33 pages for the whole bond-100
+block + ~15 for salvaging arona's poisoned pages (see rank_client.fetch_all_bond100).
+Observed submission volume is low single digits/day, so the 10-call reserve
+comfortably covers real demand.
 """
 import argparse
 from datetime import datetime, timedelta, timezone
 
 from db import get_connection, init_db
 
-CEILING = 55           # stay safely under arona's ~60/day
-REFRESH_RESERVE = 15   # always free for user-facing submissions
-SWEEP_LIMIT = CEILING - REFRESH_RESERVE   # 40: the sweep never pushes past this
+CEILING = 58           # small margin under arona's ~60/day
+REFRESH_RESERVE = 10   # always free for user-facing submissions
+SWEEP_LIMIT = CEILING - REFRESH_RESERVE   # 48: covers the global fetch + recovery
 # Rolling window for the shared cap. MUST be shorter than the daily sweep cadence
 # (24h): with a 24h window, a full ~40-call sweep is still "in window" when the
 # next daily run fires ~24h later, so that run sees 0 budget and fetches nothing

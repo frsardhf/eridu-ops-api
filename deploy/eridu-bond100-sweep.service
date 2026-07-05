@@ -1,5 +1,5 @@
 [Unit]
-Description=Eridu Bond 100 rolling /rank sweep (per-student live refresh)
+Description=Eridu Bond 100 daily global /rank refresh (whole wall in one stream)
 After=network-online.target
 Wants=network-online.target
 
@@ -15,7 +15,7 @@ Environment=BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite
 # ARONA_TOKEN ('<email>:<token>') lives in this file, VPS only, so the token
 # binds to the VPS IP. Leading "-" tolerates the file being absent.
 EnvironmentFile=-/opt/eridu-ops-api/.env
-# Walks the stalest slice of the roster within the shared daily budget. Writes
-# bond100_student_rank rows only; publishing the wall is a separate step until
-# the Phase 5 cutover wires assembly in.
-ExecStart=/opt/eridu-ops-api/services/bond100/.venv/bin/python sweep_rank.py
+# Rebuilds the whole wall from one global /rank stream (no studentId), salvaging
+# arona's poisoned pages at a finer size, then atomically replaces + publishes.
+# ~ceil(bond100/50) + recovery calls, within the shared daily budget.
+ExecStart=/opt/eridu-ops-api/services/bond100/.venv/bin/python sweep_rank.py --global

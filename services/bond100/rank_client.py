@@ -293,6 +293,34 @@ def fetch_all_bond100(token: str | None = None, max_calls: int = 200, recover_si
             "lost": lost, "poisoned": poisoned, "complete": len(out) + lost == extension}
 
 
+def fetch_tail(stored_extension: int, new_extension: int, token: str,
+               max_calls: int = 20) -> tuple[list, int, int]:
+    """Fetch the bond-100 records added since `stored_extension`. New achievers have
+    the newest rankUpdateTime, so they sit at the TAIL (positions stored+1..new). We
+    re-fetch from the page holding stored+1 (the overlap with known records dedups by
+    key) through the page holding `new`, recovering any poisoned tail page. Returns
+    (records, calls, lost); the caller merges records into the store by key."""
+    out: list = []
+    seen: set = set()
+    lost = calls = 0
+    first_page = stored_extension // GLOBAL_PAGE_SIZE + 1
+    last_page = -(-new_extension // GLOBAL_PAGE_SIZE)   # ceil(new_extension/50)
+    for p in range(first_page, last_page + 1):
+        if calls >= max_calls:
+            break
+        try:
+            data = _fetch_global_page(p, token)
+            calls += 1
+        except Exception:  # noqa: BLE001 - poisoned tail page; recover it
+            calls += 1
+            pl, pc = _recover_page(p, token, out, seen, max_calls - calls)
+            lost += pl
+            calls += pc
+            continue
+        _collect_bond100(data.get("records") or [], out, seen)
+    return out, calls, lost
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Fetch one student's live bond-100 entries from arona friends/rank.")
     ap.add_argument("--student", type=int, required=True, help="Primary SchaleDB student id (e.g. 10135).")

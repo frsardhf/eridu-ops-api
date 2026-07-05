@@ -93,37 +93,43 @@ To pause ingestion entirely (e.g. arona warns their data is dirty until a
 cleanup lands): `systemctl disable --now eridu-bond100-sync.timer`; re-enable
 later with `systemctl enable --now eridu-bond100-sync.timer`.
 
-### Daily /rank refresh (whole wall in one stream)
+### Daily /rank refresh (global fetch + incremental tail)
 
-`_info` is one call for every student but a delayed cache (it froze for 3+ weeks
-in 2026-06). `friends/rank` is live; queried **without** a `studentId` (server=4)
-it returns the whole global ranking sorted bond-descending, so the daily job
-(`sweep_rank.py --global`) pages the top bond-100 block, aggregates it per student,
-and **atomically** replaces + publishes the wall. ~`ceil(bond100/50)` pages (~33 at
-1600 bond-100) plus recovery, one shot.
+`friends/rank` queried **without** a `studentId` (server=4) returns the whole
+global ranking sorted bond-descending. Two jobs work off it:
 
-The recovery: arona's `/rank` 500s ("服务器内部错误") on pages holding certain broken
-student records (the same ids that 500 on per-student queries, e.g. Rio Armed
+- **`--global`** (seed / periodic resync): pages the entire top bond-100 block,
+  aggregates per student, and **atomically** replaces + publishes the wall.
+  ~`ceil(bond100/50)` pages (~33 at 1600 bond-100) + recovery. It also records
+  `rank_extension` (arona's bond-100 count) that the tail-fetch keys off.
+- **`--tail`** (the scheduled daily job): reads the current count from page 1, and
+  if it GREW, fetches only the tail pages holding the new records (newest
+  rankUpdateTime = end of the block) and merges them by player key. ~2-4 calls. A
+  SHRINK (a player dropped out) can't be localized, so it logs and asks you to run
+  `--global`. Needs a prior `--global` to seed the store.
+
+The recovery (both paths): arona's `/rank` 500s ("服务器内部错误") on pages holding
+certain broken student records (same ids that 500 per-student, e.g. Rio Armed
 10133); one bad record poisons its whole 50-record page. The fetch re-fetches a
-poisoned page at a finer size to salvage the innocents, losing only the few in the
-broken record's chunk. It publishes only when everything is accounted for
+poisoned page at size 5, then drills the bad chunk at size 1, losing only the
+genuinely-broken record. It publishes only when everything is accounted for
 (`fetched + lost == extension`), so a cut/partial fetch never regresses the wall.
 
 ```bash
 cd /opt/eridu-ops-api/services/bond100
-# the scheduled job, run manually:
+# seed / full resync (run once to start, and after a shrink or an arona fix):
 sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --global'
+# incremental tail (the scheduled job), run manually:
+sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --tail'
 # --force bypasses OUR budget gate (not arona's) for an off-window manual run.
-# read-only coverage report: students split by with-entries / no-entries + a
-# fetched_at distribution. No arona calls. --limit caps rows shown per group.
+# pinpoint the broken record on a poisoned page (~15 calls):
+sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --diagnose-page 16'
+# read-only report (no arona calls); and per-student debug via the old endpoint:
 sudo -u eridu bash -c 'BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite python3 sweep_rank.py --report --limit 60'
-# debug one student via the per-student endpoint (bypasses the global stream):
-sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --student 10135'
 ```
 
-The older per-student roster sweep (`sweep_rank.py` with no `--global`, plus
-`--limit`/`--student`/`--dry-run`) is kept for debugging but is no longer the
-scheduled job.
+The older per-student roster sweep (`sweep_rank.py` with no flag, plus
+`--limit`/`--student`/`--dry-run`) is kept for debugging but is no longer scheduled.
 
 #### Cutover (one-time): make the rolling sweep the wall's source
 

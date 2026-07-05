@@ -190,11 +190,16 @@ def run_global(publish: bool = True, force: bool = False) -> None:
         by_student: dict[int, list] = {}
         for r in records:
             by_student.setdefault(r["studentId"], []).append(
-                {"serverRegion": r["serverRegion"], "playerName": r["playerName"]})
+                {"serverRegion": r["serverRegion"], "playerName": r["playerName"], "key": r["key"]})
         today = date.today().isoformat()
         conn.execute("DELETE FROM bond100_student_rank")
         for sid, entries in by_student.items():
             wall_store.upsert_student(conn, sid, len(entries), entries, "rank", today)
+        # rank_extension = arona's bond-100 count; the tail-fetch reads it to know
+        # where the new records start (positions stored_extension+1 .. new).
+        conn.execute(
+            "INSERT INTO bond100_meta (key, value) VALUES ('rank_extension', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(extension),))
         conn.commit()
         print(f"global fetch: {len(records)} bond-100"
               + (f" (+{lost} lost to arona's broken records)" if lost else "")
@@ -204,6 +209,83 @@ def run_global(publish: bool = True, force: bool = False) -> None:
         conn.close()
 
     if publish:
+        summary, _ = wall_store.assemble_wall()
+        print(f"published: served wall total={summary['total']} ({len(summary['students'])} students)")
+
+
+def run_tail(publish: bool = True, force: bool = False) -> None:
+    """Cheap incremental refresh. New bond-100 achievers have the newest
+    rankUpdateTime, so they land at the tail of the stably-sorted block: read the
+    current count (page 1), and if it GREW, fetch only the tail pages holding the new
+    records and merge them by player key. ~2-4 calls vs a full ~48. A SHRINK (a
+    player dropped out) can't be localized, so it tells you to run --global for a
+    full resync. Requires a prior --global (rank_extension seeded)."""
+    init_db()
+    token = os.environ.get("ARONA_TOKEN")
+    if not token:
+        sys.exit("ARONA_TOKEN required for a tail fetch")
+
+    conn = get_connection()
+    did_change = False
+    try:
+        row = conn.execute("SELECT value FROM bond100_meta WHERE key = 'rank_extension'").fetchone()
+        if not row:
+            sys.exit("no rank_extension yet; run --global once to seed the store first.")
+        stored_e = int(row["value"])
+
+        budget_left = 100 if force else budget.sweep_budget_left(conn)
+        if budget_left < 2:
+            print(f"tail: no sweep budget (window {budget.calls_in_window(conn)}/{budget.CEILING}); skipped.")
+            return
+
+        try:
+            data = rank_client._fetch_global_page(1, token)
+        except Exception as e:  # noqa: BLE001 - page 1 down; nothing written
+            print(f"tail: page 1 failed: {e}; wall unchanged.")
+            return
+        budget.record_call(conn, "rank", 1)
+        new_e = data.get("extension") or 0
+
+        if new_e < stored_e:
+            print(f"tail: bond-100 count dropped {stored_e} -> {new_e} (a player left); a removal can't "
+                  f"be localized -> run --global for a full resync. Wall unchanged.")
+            return
+        if new_e == stored_e:
+            print(f"tail: count unchanged ({new_e}); no new bond-100. Wall unchanged.")
+            return
+
+        recs, calls, lost = rank_client.fetch_tail(stored_e, new_e, token, max_calls=budget_left - 1)
+        budget.record_call(conn, "rank", calls)
+
+        # Merge new records into the store, deduped by player key within each student.
+        existing: dict[int, tuple[list, set]] = {}
+        for r in conn.execute("SELECT student_id, entries FROM bond100_student_rank"):
+            ents = json.loads(r["entries"])
+            existing[r["student_id"]] = (ents, {e.get("key") for e in ents})
+        today = date.today().isoformat()
+        touched: set = set()
+        added = 0
+        for rec in recs:
+            ents, keys = existing.setdefault(rec["studentId"], ([], set()))
+            if rec["key"] in keys:
+                continue
+            ents.append({"serverRegion": rec["serverRegion"], "playerName": rec["playerName"], "key": rec["key"]})
+            keys.add(rec["key"])
+            touched.add(rec["studentId"])
+            added += 1
+        for sid in touched:
+            ents, _ = existing[sid]
+            wall_store.upsert_student(conn, sid, len(ents), ents, "rank", today)
+        conn.execute("UPDATE bond100_meta SET value = ? WHERE key = 'rank_extension'", (str(new_e),))
+        conn.commit()
+        did_change = added > 0
+        print(f"tail: {stored_e} -> {new_e} (+{added} new bond-100 across {len(touched)} students"
+              + (f", {lost} lost to poison" if lost else "")
+              + f") in {calls + 1} calls; budget now {budget.calls_in_window(conn)}/{budget.CEILING}")
+    finally:
+        conn.close()
+
+    if publish and did_change:
         summary, _ = wall_store.assemble_wall()
         print(f"published: served wall total={summary['total']} ({len(summary['students'])} students)")
 
@@ -301,6 +383,9 @@ def main() -> None:
     ap.add_argument("--global", dest="global_fetch", action="store_true",
                     help="Full global bond-100 refresh via one /rank stream (no studentId): "
                          "atomically replaces the whole wall. ~ceil(bond100/50) calls.")
+    ap.add_argument("--tail", action="store_true",
+                    help="Cheap incremental refresh: fetch only the newly-added bond-100 records "
+                         "at the tail and merge them. ~2-4 calls. Needs a prior --global.")
     ap.add_argument("--force", action="store_true",
                     help="With --global: bypass OUR sweep-budget gate (manual run when the window "
                          "is spent). Cannot bypass arona's own daily limit.")
@@ -316,6 +401,9 @@ def main() -> None:
         return
     if args.global_fetch:
         run_global(args.publish, force=args.force)
+        return
+    if args.tail:
+        run_tail(args.publish, force=args.force)
         return
     run_sweep(args.limit, args.dry_run, args.publish, only_ids=args.student)
 

@@ -146,6 +146,43 @@ def run_sweep(limit: int, dry_run: bool, publish: bool = True,
               f"({len(psummary['students'])} students)")
 
 
+def report_store(limit: int) -> None:
+    """Read-only: list the stalest students, split by whether they have bond-100
+    entries. No arona calls, just the local store, for watching sweep coverage."""
+    init_db()
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT student_id, count, fetched_at, source FROM bond100_student_rank "
+            "ORDER BY fetched_at ASC, student_id ASC"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    if not rows:
+        print("store is empty.")
+        return
+
+    dist: dict[str, int] = {}
+    for r in rows:
+        dist[r["fetched_at"]] = dist.get(r["fetched_at"], 0) + 1
+    print(f"store: {len(rows)} students | by fetched_at: "
+          + ", ".join(f"{d}={n}" for d, n in sorted(dist.items())))
+
+    for title, subset in (
+        ("WITH entries (count>0)", [r for r in rows if r["count"] > 0]),
+        ("NO entries (count==0)", [r for r in rows if r["count"] == 0]),
+    ):
+        shown = subset[:limit]
+        more = len(subset) - len(shown)
+        print(f"\n{title} - {len(subset)} students, stalest first"
+              + (f" (showing {limit})" if more > 0 else "") + ":")
+        for r in shown:
+            print(f"  {r['fetched_at']}  {r['student_id']:>6}  count={r['count']:>3}  {r['source']}")
+        if more > 0:
+            print(f"  ... {more} more")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Rolling per-student bond-100 sweep via arona friends/rank.")
     ap.add_argument("--limit", type=int, default=budget.SWEEP_LIMIT,
@@ -156,7 +193,13 @@ def main() -> None:
     ap.add_argument("--student", type=int, action="append", metavar="ID",
                     help="Fetch specific student id(s) now (repeatable), bypassing the roster, "
                          "stalest ordering, and per-run limit. Still records the call + publishes.")
+    ap.add_argument("--report", action="store_true",
+                    help="Read-only: list the stalest students split by entries / no entries "
+                         "(rows shown per group capped by --limit). No arona calls.")
     args = ap.parse_args()
+    if args.report:
+        report_store(args.limit)
+        return
     run_sweep(args.limit, args.dry_run, args.publish, only_ids=args.student)
 
 

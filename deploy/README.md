@@ -111,6 +111,9 @@ sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/
 # force one (or more) specific students now: skips the roster + stalest ordering
 # + per-run limit, still records the call and republishes. Repeat --student per id.
 sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --student 10133'
+# read-only coverage report: stalest students split by with-entries / no-entries,
+# plus a fetched_at distribution. No arona calls. --limit caps rows shown per group.
+sudo -u eridu bash -c 'BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite python3 sweep_rank.py --report --limit 60'
 ```
 
 After fetching, the sweep **publishes**: it reassembles the served wall blobs

@@ -171,18 +171,19 @@ def run_global(publish: bool = True, force: bool = False) -> None:
             print(f"--force: ignoring the sweep budget gate "
                   f"(sweep budget left={budget_left}, window {budget.calls_in_window(conn)}/{budget.CEILING}).")
         try:
-            records, extension, calls, complete, failed = rank_client.fetch_all_bond100(token, max_calls=max_calls)
+            res = rank_client.fetch_all_bond100(token, max_calls=max_calls)
         except Exception as e:  # noqa: BLE001 - page 1 down / network; nothing written, retry next run
             print(f"global fetch failed on page 1: {e}; served wall unchanged.")
             return
+        records, extension, calls = res["records"], res["extension"], res["calls"]
+        lost, poisoned, complete = res["lost"], res["poisoned"], res["complete"]
         budget.record_call(conn, "rank", calls)
-        if failed:
-            print(f"global fetch: pages {failed} returned 500 and were skipped "
-                  f"(arona's broken-record bug); collected {len(records)}/{extension}.")
+        if poisoned:
+            print(f"global fetch: {len(poisoned)} page(s) {poisoned} 500'd (arona's broken-record bug); "
+                  f"recovered innocents at finer size, lost {lost} record(s) to the poison.")
         if not complete:
-            print(f"global fetch incomplete: collected {len(records)}/{extension} in {calls} calls"
-                  + (f", {len(failed)} page(s) 500'd" if failed else f" (sweep budget left was {budget_left})")
-                  + "; served wall unchanged.")
+            print(f"global fetch incomplete: {len(records)} fetched + {lost} lost != {extension} "
+                  f"in {calls} calls (sweep budget left was {budget_left}); served wall unchanged.")
             conn.commit()
             return
 
@@ -195,7 +196,9 @@ def run_global(publish: bool = True, force: bool = False) -> None:
         for sid, entries in by_student.items():
             wall_store.upsert_student(conn, sid, len(entries), entries, "rank", today)
         conn.commit()
-        print(f"global fetch: {len(records)} bond-100 across {len(by_student)} students in {calls} calls; "
+        print(f"global fetch: {len(records)} bond-100"
+              + (f" (+{lost} lost to arona's broken records)" if lost else "")
+              + f" across {len(by_student)} students in {calls} calls; "
               f"budget now {budget.calls_in_window(conn)}/{budget.CEILING}")
     finally:
         conn.close()

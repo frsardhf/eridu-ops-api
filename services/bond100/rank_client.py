@@ -148,41 +148,89 @@ def fetch_student(student_id: int, token: str | None = None) -> tuple[int, list,
     return count, entries, calls
 
 
-def _fetch_global_page(page: int, token: str, timeout: int = 30) -> dict:
+def _fetch_global_page(page: int, token: str, size: int = GLOBAL_PAGE_SIZE, timeout: int = 30) -> dict:
     """One page of the GLOBAL (no studentId) bond ranking, sorted bond-descending."""
     req = urllib.request.Request(
         API_URL,
-        data=json.dumps({"page": page, "size": GLOBAL_PAGE_SIZE, "server": 4}).encode(),
+        data=json.dumps({"page": page, "size": size, "server": 4}).encode(),
         headers={"Content-Type": "application/json", "Authorization": f"ba-token {token}"},
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as r:
         body = json.loads(r.read().decode("utf-8"))
     if body.get("code") != 200 or not isinstance(body.get("data"), dict):
-        raise RuntimeError(f"arona /rank (global) page={page} code={body.get('code')} "
-                           f"message={body.get('message')!r}")
+        raise RuntimeError(f"arona /rank (global) page={page} size={size} "
+                           f"code={body.get('code')} message={body.get('message')!r}")
     return body["data"]
 
 
-def fetch_all_bond100(token: str | None = None, max_calls: int = 200) -> tuple[list, int, int, bool, list]:
+def _collect_bond100(records: list, out: list, seen: set) -> bool:
+    """Append bond-100 records (deduped by (key, studentId), student collapsed to
+    primary, non-global/blank dropped) to `out`. Return True once a record drops
+    below bond 100 (the sorted block has ended)."""
+    for rec in records:
+        assists = rec.get("assistInfoList") or []
+        assist = assists[0] if assists else None
+        fr = assist.get("favorRank") if assist else None
+        if fr is None:
+            continue
+        if fr < TARGET_BOND:
+            return True
+        region = ID_TO_REGION.get(rec.get("server"))
+        if region is None:
+            continue
+        name = (rec.get("nickname") or "").strip()
+        key = rec.get("key")
+        uid = assist.get("uniqueId")
+        if not name or not key or uid is None:
+            continue
+        sid = primary_student_id(uid)
+        if (key, sid) in seen:
+            continue
+        seen.add((key, sid))
+        out.append({"key": key, "serverRegion": region, "playerName": name, "studentId": sid})
+    return False
+
+
+def _recover_page(page: int, token: str, out: list, seen: set, sub_size: int) -> tuple[int, int]:
+    """Salvage a poisoned size-50 page by re-fetching its exact record range at a
+    finer `sub_size`. arona's 500 poisons the whole 50-page over one broken record;
+    at sub_size only the chunk holding that record still 500s, so we recover the
+    rest. Returns (lost, calls): `lost` = records in sub-chunks that STILL 500."""
+    per = GLOBAL_PAGE_SIZE // sub_size          # sub-pages covering one size-50 page
+    first = (page - 1) * per + 1                # positions align (stable sort)
+    lost = calls = 0
+    for q in range(first, first + per):
+        try:
+            data = _fetch_global_page(q, token, size=sub_size)
+        except Exception:  # noqa: BLE001 - the broken record's chunk; lose only these few
+            lost += sub_size
+            calls += 1
+            continue
+        calls += 1
+        _collect_bond100(data.get("records") or [], out, seen)
+    return lost, calls
+
+
+def fetch_all_bond100(token: str | None = None, max_calls: int = 200, recover_size: int = 5) -> dict:
     """Fetch the ENTIRE global bond-100 block from friends/rank (no studentId,
-    server=4), paging until favorRank drops below 100. Accumulates fully in memory
-    so a partial/failed fetch commits nothing.
+    server=4), paging until favorRank drops below 100, then salvaging any page that
+    500'd by re-fetching it at `recover_size` (arona's broken-record bug poisons a
+    whole 50-page over one record). Accumulates fully in memory; the caller commits
+    nothing unless the result is `complete`.
 
-    Returns (records, extension, calls, complete, failed_pages):
-      records      = [{key, serverRegion, playerName, studentId}] bond-100 only,
-                     student collapsed to primary, deduped by (key, studentId).
-      extension    = arona's reported bond-100 count (read from page 1).
-      calls        = arona requests issued.
-      complete     = True only if we paged the whole block, len(records)==extension,
-                     AND no page 500'd.
-      failed_pages = pages that returned 500 and were skipped (arona's known
-                     internal-error bug on certain records poisons the page).
+    Returns a dict:
+      records   = [{key, serverRegion, playerName, studentId}] bond-100 only.
+      extension = arona's reported bond-100 count (page 1).
+      calls     = arona requests issued.
+      lost      = records we couldn't fetch even at recover_size (the genuine
+                  poison + a little collateral in that finest chunk).
+      poisoned  = the size-50 pages that 500'd.
+      complete  = len(records) + lost == extension, i.e. every record is accounted
+                  for (fetched or genuinely unfetchable) with no budget cutoff.
 
-    Page 1 failing raises (the endpoint is down / we can't even get extension).
-    Deeper pages that 500 are skipped and reported, so one run diagnoses the
-    poisoning. If page 1 shows the block needs more than max_calls pages, it stops
-    after page 1 (complete=False)."""
+    Page 1 failing raises. If page 1 shows the block needs more pages than max_calls,
+    it stops after page 1 (complete=False)."""
     token = token or os.environ.get("ARONA_TOKEN")
     if not token:
         raise RuntimeError("ARONA_TOKEN required for a /rank fetch")
@@ -190,57 +238,43 @@ def fetch_all_bond100(token: str | None = None, max_calls: int = 200) -> tuple[l
     out: list = []
     seen: set = set()
 
-    def collect(records: list) -> bool:
-        """Add bond-100 records; return True once a record drops below bond 100
-        (the sorted block has ended)."""
-        for rec in records:
-            assists = rec.get("assistInfoList") or []
-            assist = assists[0] if assists else None
-            fr = assist.get("favorRank") if assist else None
-            if fr is None:
-                continue
-            if fr < TARGET_BOND:
-                return True
-            region = ID_TO_REGION.get(rec.get("server"))
-            if region is None:
-                continue
-            name = (rec.get("nickname") or "").strip()
-            key = rec.get("key")
-            uid = assist.get("uniqueId")
-            if not name or not key or uid is None:
-                continue
-            sid = primary_student_id(uid)
-            if (key, sid) in seen:
-                continue
-            seen.add((key, sid))
-            out.append({"key": key, "serverRegion": region, "playerName": name, "studentId": sid})
-        return False
-
     # Page 1 gives extension; if it fails the endpoint is down -> raise.
     data = _fetch_global_page(1, token)
     calls = 1
     extension = data.get("extension") or 0
     needed = -(-extension // GLOBAL_PAGE_SIZE) if extension else 1   # ceil(extension/50)
     if needed > max_calls:
-        return out, extension, calls, False, []   # budget too low to finish; caller skips
+        return {"records": out, "extension": extension, "calls": calls,
+                "lost": 0, "poisoned": [], "complete": False}
 
-    failed: list = []
-    dipped = collect(data.get("records") or [])
+    poisoned: list = []
+    dipped = _collect_bond100(data.get("records") or [], out, seen)
     page = 2
     while not dipped and page <= needed + 2 and calls < max_calls:  # +2 slack for the boundary
         try:
             data = _fetch_global_page(page, token)
-        except Exception:  # noqa: BLE001 - a poisoned/transient page; skip it, keep going
-            failed.append(page)
+        except Exception:  # noqa: BLE001 - a poisoned page; note it, recover it below
+            poisoned.append(page)
             calls += 1
             page += 1
             continue
         calls += 1
-        dipped = collect(data.get("records") or [])
+        dipped = _collect_bond100(data.get("records") or [], out, seen)
         page += 1
 
-    complete = len(out) == extension and not failed
-    return out, extension, calls, complete, failed
+    # Recovery pass: salvage each poisoned page at the finer size. Only start a page
+    # we can fully process, so accounting (collected + lost) stays exact.
+    per = GLOBAL_PAGE_SIZE // recover_size
+    lost = 0
+    for p in poisoned:
+        if calls + per > max_calls:
+            break
+        pl, pc = _recover_page(p, token, out, seen, recover_size)
+        lost += pl
+        calls += pc
+
+    return {"records": out, "extension": extension, "calls": calls,
+            "lost": lost, "poisoned": poisoned, "complete": len(out) + lost == extension}
 
 
 def main() -> None:

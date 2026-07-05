@@ -192,22 +192,37 @@ def _collect_bond100(records: list, out: list, seen: set) -> bool:
     return False
 
 
-def _recover_page(page: int, token: str, out: list, seen: set, sub_size: int) -> tuple[int, int]:
-    """Salvage a poisoned size-50 page by re-fetching its exact record range at a
-    finer `sub_size`. arona's 500 poisons the whole 50-page over one broken record;
-    at sub_size only the chunk holding that record still 500s, so we recover the
-    rest. Returns (lost, calls): `lost` = records in sub-chunks that STILL 500."""
+def _recover_page(page: int, token: str, out: list, seen: set, budget_calls: int,
+                  sub_size: int = 5) -> tuple[int, int]:
+    """Salvage a poisoned size-50 page. Re-fetch its exact record range at `sub_size`;
+    any sub-chunk that STILL 500s is drilled at size 1, so we recover every innocent
+    record and lose ONLY the genuinely-broken position(s) (the ones that 500 even
+    alone). Stops if budget_calls is reached (caller then sees an incomplete result
+    and won't publish). Returns (lost, calls): lost = records that 500 at size 1.
+    Positions align across sizes because the block is stably sorted by rankUpdateTime."""
     per = GLOBAL_PAGE_SIZE // sub_size          # sub-pages covering one size-50 page
-    first = (page - 1) * per + 1                # positions align (stable sort)
+    first = (page - 1) * per + 1
     lost = calls = 0
     for q in range(first, first + per):
+        if calls >= budget_calls:
+            break
         try:
             data = _fetch_global_page(q, token, size=sub_size)
-        except Exception:  # noqa: BLE001 - the broken record's chunk; lose only these few
-            lost += sub_size
             calls += 1
+        except Exception:  # noqa: BLE001 - poisoned chunk; drill it at size 1
+            calls += 1
+            lo = (q - 1) * sub_size + 1
+            for pos in range(lo, lo + sub_size):
+                if calls >= budget_calls:
+                    break
+                try:
+                    d1 = _fetch_global_page(pos, token, size=1)
+                    calls += 1
+                    _collect_bond100(d1.get("records") or [], out, seen)
+                except Exception:  # noqa: BLE001 - the genuinely broken record
+                    calls += 1
+                    lost += 1
             continue
-        calls += 1
         _collect_bond100(data.get("records") or [], out, seen)
     return lost, calls
 
@@ -223,8 +238,8 @@ def fetch_all_bond100(token: str | None = None, max_calls: int = 200, recover_si
       records   = [{key, serverRegion, playerName, studentId}] bond-100 only.
       extension = arona's reported bond-100 count (page 1).
       calls     = arona requests issued.
-      lost      = records we couldn't fetch even at recover_size (the genuine
-                  poison + a little collateral in that finest chunk).
+      lost      = records that 500 even at size 1 (the genuinely broken records;
+                  innocents in a poisoned chunk are drilled out and recovered).
       poisoned  = the size-50 pages that 500'd.
       complete  = len(records) + lost == extension, i.e. every record is accounted
                   for (fetched or genuinely unfetchable) with no budget cutoff.
@@ -262,14 +277,15 @@ def fetch_all_bond100(token: str | None = None, max_calls: int = 200, recover_si
         dipped = _collect_bond100(data.get("records") or [], out, seen)
         page += 1
 
-    # Recovery pass: salvage each poisoned page at the finer size. Only start a page
-    # we can fully process, so accounting (collected + lost) stays exact.
-    per = GLOBAL_PAGE_SIZE // recover_size
+    # Recovery pass: salvage each poisoned page (size sub -> size 1). Bounded by the
+    # remaining budget; a page truncated by budget leaves the result incomplete, so
+    # the caller won't publish (accounting stays exact: collected + lost == extension
+    # only when every record was fetched or isolated as genuinely broken).
     lost = 0
     for p in poisoned:
-        if calls + per > max_calls:
+        if calls >= max_calls:
             break
-        pl, pc = _recover_page(p, token, out, seen, recover_size)
+        pl, pc = _recover_page(p, token, out, seen, max_calls - calls, recover_size)
         lost += pl
         calls += pc
 

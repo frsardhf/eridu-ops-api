@@ -146,14 +146,18 @@ def run_sweep(limit: int, dry_run: bool, publish: bool = True,
               f"({len(psummary['students'])} students)")
 
 
-def run_global(publish: bool = True) -> None:
+def run_global(publish: bool = True, force: bool = False) -> None:
     """Full global bond-100 refresh: one /rank stream (no studentId) -> aggregate
     per student -> ATOMICALLY replace the table -> publish. ~ceil(bond100/50) calls.
 
     Atomic: the whole bond-100 block is fetched + validated (collected count ==
     arona's `extension`) in memory before any DB write, and the replace runs in a
     single transaction. A cut, failed, or budget-limited fetch commits nothing, so
-    the served wall is never left partial."""
+    the served wall is never left partial.
+
+    force=True bypasses OUR sweep-budget gate (for a manual run when the window is
+    spent). It can't bypass arona's own daily limit: if arona rate-limits mid-fetch
+    the fetch just fails atomically and the wall is left unchanged."""
     init_db()
     token = os.environ.get("ARONA_TOKEN")
     if not token:
@@ -162,8 +166,12 @@ def run_global(publish: bool = True) -> None:
     conn = get_connection()
     try:
         budget_left = budget.sweep_budget_left(conn)
+        max_calls = 100 if force else budget_left
+        if force:
+            print(f"--force: ignoring the sweep budget gate "
+                  f"(sweep budget left={budget_left}, window {budget.calls_in_window(conn)}/{budget.CEILING}).")
         try:
-            records, extension, calls, complete = rank_client.fetch_all_bond100(token, max_calls=budget_left)
+            records, extension, calls, complete = rank_client.fetch_all_bond100(token, max_calls=max_calls)
         except Exception as e:  # noqa: BLE001 - network/parse; nothing written, retry next run
             print(f"global fetch failed mid-stream: {e}; served wall unchanged.")
             return
@@ -246,12 +254,15 @@ def main() -> None:
     ap.add_argument("--global", dest="global_fetch", action="store_true",
                     help="Full global bond-100 refresh via one /rank stream (no studentId): "
                          "atomically replaces the whole wall. ~ceil(bond100/50) calls.")
+    ap.add_argument("--force", action="store_true",
+                    help="With --global: bypass OUR sweep-budget gate (manual run when the window "
+                         "is spent). Cannot bypass arona's own daily limit.")
     args = ap.parse_args()
     if args.report:
         report_store(args.limit)
         return
     if args.global_fetch:
-        run_global(args.publish)
+        run_global(args.publish, force=args.force)
         return
     run_sweep(args.limit, args.dry_run, args.publish, only_ids=args.student)
 

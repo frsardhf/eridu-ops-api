@@ -115,7 +115,9 @@ def run_sweep(limit: int, dry_run: bool, publish: bool = True,
             try:
                 count, entries, calls = rank_client.fetch_student(sid, token)
             except Exception as e:  # noqa: BLE001 - skip a bad student, keep sweeping
-                log.warning("sweep: student %s fetch failed: %s", sid, type(e).__name__)
+                # Log the full reason (arona code/message, e.g. a 500 for alt-style
+                # ids), not just the exception type, so failures are diagnosable.
+                log.warning("sweep: student %s fetch failed: %s", sid, e)
                 continue
             budget.record_call(conn, "rank", calls)
             row = conn.execute(

@@ -159,25 +159,30 @@ def _fetch_global_page(page: int, token: str, timeout: int = 30) -> dict:
     with urllib.request.urlopen(req, timeout=timeout) as r:
         body = json.loads(r.read().decode("utf-8"))
     if body.get("code") != 200 or not isinstance(body.get("data"), dict):
-        raise RuntimeError(f"arona /rank (global) code={body.get('code')} message={body.get('message')!r}")
+        raise RuntimeError(f"arona /rank (global) page={page} code={body.get('code')} "
+                           f"message={body.get('message')!r}")
     return body["data"]
 
 
-def fetch_all_bond100(token: str | None = None, max_calls: int = 200) -> tuple[list, int, int, bool]:
+def fetch_all_bond100(token: str | None = None, max_calls: int = 200) -> tuple[list, int, int, bool, list]:
     """Fetch the ENTIRE global bond-100 block from friends/rank (no studentId,
     server=4), paging until favorRank drops below 100. Accumulates fully in memory
     so a partial/failed fetch commits nothing.
 
-    Returns (records, extension, calls, complete):
-      records  = [{key, serverRegion, playerName, studentId}] bond-100 only, student
-                 collapsed to primary, deduped by (key, studentId).
-      extension= arona's reported bond-100 count (read from page 1).
-      calls    = arona requests issued.
-      complete = True only if the whole block was paged AND len(records)==extension.
+    Returns (records, extension, calls, complete, failed_pages):
+      records      = [{key, serverRegion, playerName, studentId}] bond-100 only,
+                     student collapsed to primary, deduped by (key, studentId).
+      extension    = arona's reported bond-100 count (read from page 1).
+      calls        = arona requests issued.
+      complete     = True only if we paged the whole block, len(records)==extension,
+                     AND no page 500'd.
+      failed_pages = pages that returned 500 and were skipped (arona's known
+                     internal-error bug on certain records poisons the page).
 
-    If page 1 shows the block needs more than max_calls pages, it stops after page 1
-    (complete=False) so the caller can skip rather than spend a partial budget. Raises
-    on a non-200 arona response (caller commits nothing)."""
+    Page 1 failing raises (the endpoint is down / we can't even get extension).
+    Deeper pages that 500 are skipped and reported, so one run diagnoses the
+    poisoning. If page 1 shows the block needs more than max_calls pages, it stops
+    after page 1 (complete=False)."""
     token = token or os.environ.get("ARONA_TOKEN")
     if not token:
         raise RuntimeError("ARONA_TOKEN required for a /rank fetch")
@@ -211,20 +216,31 @@ def fetch_all_bond100(token: str | None = None, max_calls: int = 200) -> tuple[l
             out.append({"key": key, "serverRegion": region, "playerName": name, "studentId": sid})
         return False
 
+    # Page 1 gives extension; if it fails the endpoint is down -> raise.
     data = _fetch_global_page(1, token)
     calls = 1
     extension = data.get("extension") or 0
     needed = -(-extension // GLOBAL_PAGE_SIZE) if extension else 1   # ceil(extension/50)
     if needed > max_calls:
-        return out, extension, calls, False   # budget too low to finish; caller skips
+        return out, extension, calls, False, []   # budget too low to finish; caller skips
 
+    failed: list = []
     dipped = collect(data.get("records") or [])
-    while not dipped and not data.get("lastPage") and calls < needed + 3:  # +3 slack for the boundary
+    page = 2
+    while not dipped and page <= needed + 2 and calls < max_calls:  # +2 slack for the boundary
+        try:
+            data = _fetch_global_page(page, token)
+        except Exception:  # noqa: BLE001 - a poisoned/transient page; skip it, keep going
+            failed.append(page)
+            calls += 1
+            page += 1
+            continue
         calls += 1
-        data = _fetch_global_page(calls, token)
         dipped = collect(data.get("records") or [])
+        page += 1
 
-    return out, extension, calls, len(out) == extension
+    complete = len(out) == extension and not failed
+    return out, extension, calls, complete, failed
 
 
 def main() -> None:

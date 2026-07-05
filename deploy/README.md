@@ -93,33 +93,37 @@ To pause ingestion entirely (e.g. arona warns their data is dirty until a
 cleanup lands): `systemctl disable --now eridu-bond100-sync.timer`; re-enable
 later with `systemctl enable --now eridu-bond100-sync.timer`.
 
-### Rolling /rank sweep (live per-student counts)
+### Daily /rank refresh (whole wall in one stream)
 
 `_info` is one call for every student but a delayed cache (it froze for 3+ weeks
-in 2026-06). `friends/rank` is live but per-student, so `sweep_rank.py` refreshes
-the wall a slice at a time: each run fetches the stalest students (never-fetched
-first, so a newly released student `_info` missed is caught within a cycle),
-writing `bond100_student_rank` rows. At ~40 students/run the ~250 roster refreshes
-over ~6-7 days.
+in 2026-06). `friends/rank` is live; queried **without** a `studentId` (server=4)
+it returns the whole global ranking sorted bond-descending, so the daily job
+(`sweep_rank.py --global`) pages the top bond-100 block, aggregates it per student,
+and **atomically** replaces + publishes the wall. ~`ceil(bond100/50)` pages (~33 at
+1600 bond-100) plus recovery, one shot.
+
+The recovery: arona's `/rank` 500s ("服务器内部错误") on pages holding certain broken
+student records (the same ids that 500 on per-student queries, e.g. Rio Armed
+10133); one bad record poisons its whole 50-record page. The fetch re-fetches a
+poisoned page at a finer size to salvage the innocents, losing only the few in the
+broken record's chunk. It publishes only when everything is accounted for
+(`fetched + lost == extension`), so a cut/partial fetch never regresses the wall.
 
 ```bash
 cd /opt/eridu-ops-api/services/bond100
-# dry-run: roster + what would be fetched, no arona calls
-sudo -u eridu bash -c 'BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite python3 sweep_rank.py --dry-run'
-# small live run (spends budget); omit --limit for a full ~40-student run
-sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --limit 3'
-# force one (or more) specific students now: skips the roster + stalest ordering
-# + per-run limit, still records the call and republishes. Repeat --student per id.
-sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --student 10133'
-# read-only coverage report: stalest students split by with-entries / no-entries,
-# plus a fetched_at distribution. No arona calls. --limit caps rows shown per group.
+# the scheduled job, run manually:
+sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --global'
+# --force bypasses OUR budget gate (not arona's) for an off-window manual run.
+# read-only coverage report: students split by with-entries / no-entries + a
+# fetched_at distribution. No arona calls. --limit caps rows shown per group.
 sudo -u eridu bash -c 'BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite python3 sweep_rank.py --report --limit 60'
+# debug one student via the per-student endpoint (bypasses the global stream):
+sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --student 10135'
 ```
 
-After fetching, the sweep **publishes**: it reassembles the served wall blobs
-(`wall_summary` + `entries`) from `bond100_student_rank`, so swept students appear
-on the Hall. Pass `--no-publish` to write rows without touching the served wall
-(validation only).
+The older per-student roster sweep (`sweep_rank.py` with no `--global`, plus
+`--limit`/`--student`/`--dry-run`) is kept for debugging but is no longer the
+scheduled job.
 
 #### Cutover (one-time): make the rolling sweep the wall's source
 

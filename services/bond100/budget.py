@@ -21,7 +21,12 @@ from db import get_connection, init_db
 CEILING = 55           # stay safely under arona's ~60/day
 REFRESH_RESERVE = 15   # always free for user-facing submissions
 SWEEP_LIMIT = CEILING - REFRESH_RESERVE   # 40: the sweep never pushes past this
-WINDOW_HOURS = 24      # rolling window (matches the /refresh cooldown bookkeeping)
+# Rolling window for the shared cap. MUST be shorter than the daily sweep cadence
+# (24h): with a 24h window, a full ~40-call sweep is still "in window" when the
+# next daily run fires ~24h later, so that run sees 0 budget and fetches nothing
+# (coverage then crawls, alternating 40/0 per day). 20h leaves a clear margin so
+# each daily run starts with a fresh sweep budget.
+WINDOW_HOURS = 20
 
 
 def record_call(conn, kind: str, count: int = 1) -> None:
@@ -75,7 +80,7 @@ def usage(conn) -> dict:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Show the shared arona call budget (rolling 24h).")
+    ap = argparse.ArgumentParser(description=f"Show the shared arona call budget (rolling {WINDOW_HOURS}h).")
     ap.add_argument("--hours", type=int, default=WINDOW_HOURS, help="Window size in hours.")
     ap.parse_args()
     init_db()

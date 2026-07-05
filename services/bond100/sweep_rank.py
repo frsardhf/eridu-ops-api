@@ -208,6 +208,46 @@ def run_global(publish: bool = True, force: bool = False) -> None:
         print(f"published: served wall total={summary['total']} ({len(summary['students'])} students)")
 
 
+def diagnose_page(page: int) -> None:
+    """Pinpoint arona's broken record(s) on a poisoned page: re-fetch its 50-record
+    range at size 5 to find the 500-ing chunk, then at size 1 to isolate the exact
+    position that 500s (the genuine broken record) and print the innocent players
+    recoverable around it. ~15 arona calls. Positions are global bond-100 ranks."""
+    token = os.environ.get("ARONA_TOKEN")
+    if not token:
+        sys.exit("ARONA_TOKEN required")
+    size50 = rank_client.GLOBAL_PAGE_SIZE
+    base = (page - 1) * size50
+    print(f"page {page} = global bond-100 positions {base + 1}..{base + size50}; scanning at size 5...")
+    per5 = size50 // 5
+    first5 = (page - 1) * per5 + 1
+    bad = []
+    for q in range(first5, first5 + per5):
+        try:
+            rank_client._fetch_global_page(q, token, size=5)
+        except Exception:  # noqa: BLE001
+            bad.append(q)
+            print(f"  size-5 chunk page {q} (positions {(q - 1) * 5 + 1}..{q * 5}): 500")
+    if not bad:
+        print("  no chunk 500'd now (transient?); nothing to isolate.")
+        return
+    for q in bad:
+        lo = (q - 1) * 5 + 1
+        print(f"  isolating positions {lo}..{lo + 4} at size 1:")
+        for pos in range(lo, lo + 5):
+            try:
+                d = rank_client._fetch_global_page(pos, token, size=1)
+                rec = (d.get("records") or [None])[0]
+                if not rec:
+                    print(f"    pos {pos}: OK (empty)")
+                    continue
+                a = (rec.get("assistInfoList") or [{}])[0]
+                print(f"    pos {pos}: OK  student={primary_student_id(a.get('uniqueId'))} "
+                      f"favorRank={a.get('favorRank')} server={rec.get('server')} nick={rec.get('nickname')!r}")
+            except Exception:  # noqa: BLE001
+                print(f"    pos {pos}: 500  <-- BROKEN record (arona can't serve this one)")
+
+
 def report_store(limit: int) -> None:
     """Read-only: list the stalest students, split by whether they have bond-100
     entries. No arona calls, just the local store, for watching sweep coverage."""
@@ -264,9 +304,15 @@ def main() -> None:
     ap.add_argument("--force", action="store_true",
                     help="With --global: bypass OUR sweep-budget gate (manual run when the window "
                          "is spent). Cannot bypass arona's own daily limit.")
+    ap.add_argument("--diagnose-page", type=int, metavar="N",
+                    help="Drill poisoned page N (size 5 -> size 1) to pinpoint the broken record(s) "
+                         "and show the innocent players around it. ~15 arona calls.")
     args = ap.parse_args()
     if args.report:
         report_store(args.limit)
+        return
+    if args.diagnose_page:
+        diagnose_page(args.diagnose_page)
         return
     if args.global_fetch:
         run_global(args.publish, force=args.force)

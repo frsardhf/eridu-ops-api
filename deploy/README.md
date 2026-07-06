@@ -130,6 +130,10 @@ cd /opt/eridu-ops-api/services/bond100
 sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --global'
 # incremental tail (the scheduled job), run manually:
 sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --tail'
+# PREVIEW a tail run without mutating the store (so you don't have to re-seed to
+# re-test): prints "WOULD add +N; served wall X -> X+N" and writes nothing. Still
+# spends the ~2-4 arona calls, since that's how it computes the diff.
+sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --tail --dry-run --force'
 # --force bypasses OUR budget gate (not arona's) for an off-window manual run.
 # pinpoint the broken record on a poisoned page (~15 calls):
 sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --diagnose-page 16'

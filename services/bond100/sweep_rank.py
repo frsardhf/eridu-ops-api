@@ -214,14 +214,19 @@ def run_global(publish: bool = True, force: bool = False) -> None:
         print(f"published: served wall total={summary['total']} ({len(summary['students'])} students)")
 
 
-def run_tail(publish: bool = True, force: bool = False) -> None:
+def run_tail(publish: bool = True, force: bool = False, dry_run: bool = False) -> None:
     """Cheap incremental refresh. New bond-100 achievers have the newest
     rankUpdateTime, so they land at the tail of the stably-sorted block: read the
     current count (page 1), and if it GREW, fetch only the tail pages holding the new
     records and merge them by rankUpdateTime (stable across the refreshes that fill the
     overlap region; `key` is not). ~2-4 calls vs a full ~48. A SHRINK (a
     player dropped out) can't be localized, so it tells you to run --global for a
-    full resync. Requires a prior --global (rank_extension seeded)."""
+    full resync. Requires a prior --global (rank_extension seeded).
+
+    dry_run=True previews the diff (add count + projected wall total) and writes
+    NOTHING: no entries, no rank_extension bump, no publish, so you can confirm a run
+    without having to re-seed with --global afterwards. It still makes the arona calls
+    (that's how it computes the diff) and records them against the budget."""
     init_db()
     token = os.environ.get("ARONA_TOKEN")
     if not token:
@@ -280,6 +285,15 @@ def run_tail(publish: bool = True, force: bool = False) -> None:
             ruts.add(rec["rut"])
             touched.add(rec["studentId"])
             added += 1
+
+        if dry_run:
+            cur, _ = wall_store.build_wall(wall_store.read_all_students(conn))
+            print(f"DRY-RUN tail: {stored_e} -> {new_e}; WOULD add +{added} across {len(touched)} students"
+                  + (f", {lost} lost to poison" if lost else "")
+                  + f"; served wall {cur['total']} -> {cur['total'] + added}. "
+                  f"No writes (rank_extension stays {stored_e}); {calls + 1} arona calls spent.")
+            return
+
         for sid in touched:
             ents, _ = existing[sid]
             wall_store.upsert_student(conn, sid, len(ents), ents, "rank", today)
@@ -378,7 +392,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Rolling per-student bond-100 sweep via arona friends/rank.")
     ap.add_argument("--limit", type=int, default=budget.SWEEP_LIMIT,
                     help=f"Max students to fetch this run (default {budget.SWEEP_LIMIT}; also bounded by the shared budget).")
-    ap.add_argument("--dry-run", action="store_true", help="Show roster + what would be fetched; write nothing, no calls.")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="Preview only, write nothing. Roster sweep: shows what would be fetched (no calls). "
+                         "With --tail: fetches to compute the diff and prints the add count + projected wall "
+                         "total, but makes no writes, so you can confirm without re-seeding via --global.")
     ap.add_argument("--no-publish", action="store_false", dest="publish",
                     help="Fetch + write rows but do NOT rebuild the served wall (validation only).")
     ap.add_argument("--student", type=int, action="append", metavar="ID",
@@ -410,7 +427,7 @@ def main() -> None:
         run_global(args.publish, force=args.force)
         return
     if args.tail:
-        run_tail(args.publish, force=args.force)
+        run_tail(args.publish, force=args.force, dry_run=args.dry_run)
         return
     run_sweep(args.limit, args.dry_run, args.publish, only_ids=args.student)
 

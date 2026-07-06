@@ -190,7 +190,8 @@ def run_global(publish: bool = True, force: bool = False) -> None:
         by_student: dict[int, list] = {}
         for r in records:
             by_student.setdefault(r["studentId"], []).append(
-                {"serverRegion": r["serverRegion"], "playerName": r["playerName"], "key": r["key"]})
+                {"serverRegion": r["serverRegion"], "playerName": r["playerName"],
+                 "key": r["key"], "rut": r["rut"]})
         today = date.today().isoformat()
         conn.execute("DELETE FROM bond100_student_rank")
         for sid, entries in by_student.items():
@@ -217,7 +218,8 @@ def run_tail(publish: bool = True, force: bool = False) -> None:
     """Cheap incremental refresh. New bond-100 achievers have the newest
     rankUpdateTime, so they land at the tail of the stably-sorted block: read the
     current count (page 1), and if it GREW, fetch only the tail pages holding the new
-    records and merge them by player key. ~2-4 calls vs a full ~48. A SHRINK (a
+    records and merge them by rankUpdateTime (stable across the refreshes that fill the
+    overlap region; `key` is not). ~2-4 calls vs a full ~48. A SHRINK (a
     player dropped out) can't be localized, so it tells you to run --global for a
     full resync. Requires a prior --global (rank_extension seeded)."""
     init_db()
@@ -257,20 +259,25 @@ def run_tail(publish: bool = True, force: bool = False) -> None:
         recs, calls, lost = rank_client.fetch_tail(stored_e, new_e, token, max_calls=budget_left - 1)
         budget.record_call(conn, "rank", calls)
 
-        # Merge new records into the store, deduped by player key within each student.
+        # Merge new records into the store, deduped by rankUpdateTime (`rut`, arona's
+        # stable "recorded time") within each student. The tail's overlap region is
+        # full of refreshers, and a refresh regenerates `key` while leaving `rut`
+        # fixed, so a key-dedup would re-add every refresher (the old +30 over-count);
+        # rut recognizes them. Needs a store re-seeded by a --global that wrote `rut`.
         existing: dict[int, tuple[list, set]] = {}
         for r in conn.execute("SELECT student_id, entries FROM bond100_student_rank"):
             ents = json.loads(r["entries"])
-            existing[r["student_id"]] = (ents, {e.get("key") for e in ents})
+            existing[r["student_id"]] = (ents, {e.get("rut") for e in ents})
         today = date.today().isoformat()
         touched: set = set()
         added = 0
         for rec in recs:
-            ents, keys = existing.setdefault(rec["studentId"], ([], set()))
-            if rec["key"] in keys:
+            ents, ruts = existing.setdefault(rec["studentId"], ([], set()))
+            if rec["rut"] in ruts:
                 continue
-            ents.append({"serverRegion": rec["serverRegion"], "playerName": rec["playerName"], "key": rec["key"]})
-            keys.add(rec["key"])
+            ents.append({"serverRegion": rec["serverRegion"], "playerName": rec["playerName"],
+                         "key": rec["key"], "rut": rec["rut"]})
+            ruts.add(rec["rut"])
             touched.add(rec["studentId"])
             added += 1
         for sid in touched:

@@ -8,10 +8,14 @@ arona's daily token budget.
 
 Response shape (probed live against arona):
   data.records[]:
-    key        -- stable per-player id (dedup anchor; the friend code is NOT here)
+    key        -- per-SNAPSHOT record id; REGENERATES when a player refreshes their
+                  arona data, so it's safe for intra-fetch dedup but NOT across time
     server     -- per-server id; we keep the global ones (5-9)
     nickname   -- player name shown on the wall
-    assistInfoList[]: { uniqueId, favorRank, ... }  -- per-student bond level
+    assistInfoList[]: { uniqueId, favorRank, rankUpdateTime, ... }  -- per-student
+                  bond level. rankUpdateTime is arona's "Recorded Time": fixed when
+                  the entry was first recorded and STABLE across refreshes, so it's
+                  the cross-time (tail-merge) dedup anchor. The friend code is NOT here.
   data.extension -- bond-100 count for the queried student (the site's 百绊 N badge)
   data.lastPage  -- bool
 
@@ -165,9 +169,12 @@ def _fetch_global_page(page: int, token: str, size: int = GLOBAL_PAGE_SIZE, time
 
 
 def _collect_bond100(records: list, out: list, seen: set) -> bool:
-    """Append bond-100 records (deduped by (key, studentId), student collapsed to
-    primary, non-global/blank dropped) to `out`. Return True once a record drops
-    below bond 100 (the sorted block has ended)."""
+    """Append bond-100 records to `out` (student collapsed to primary, non-global/blank
+    dropped), deduped within a fetch by (key, studentId). Each record also carries
+    `rut` (rankUpdateTime, arona's stable "recorded time"), which the cross-time tail
+    merge dedups on instead: `key` regenerates on refresh, so it can't recognize a
+    refreshed player across two fetches, but `rut` stays fixed. Return True once a
+    record drops below bond 100 (the sorted block has ended)."""
     for rec in records:
         assists = rec.get("assistInfoList") or []
         assist = assists[0] if assists else None
@@ -181,14 +188,15 @@ def _collect_bond100(records: list, out: list, seen: set) -> bool:
             continue
         name = (rec.get("nickname") or "").strip()
         key = rec.get("key")
+        rut = assist.get("rankUpdateTime")
         uid = assist.get("uniqueId")
-        if not name or not key or uid is None:
+        if not name or not key or rut is None or uid is None:
             continue
         sid = primary_student_id(uid)
         if (key, sid) in seen:
             continue
         seen.add((key, sid))
-        out.append({"key": key, "serverRegion": region, "playerName": name, "studentId": sid})
+        out.append({"key": key, "rut": rut, "serverRegion": region, "playerName": name, "studentId": sid})
     return False
 
 
@@ -235,7 +243,7 @@ def fetch_all_bond100(token: str | None = None, max_calls: int = 200, recover_si
     nothing unless the result is `complete`.
 
     Returns a dict:
-      records   = [{key, serverRegion, playerName, studentId}] bond-100 only.
+      records   = [{key, rut, serverRegion, playerName, studentId}] bond-100 only.
       extension = arona's reported bond-100 count (page 1).
       calls     = arona requests issued.
       lost      = records that 500 even at size 1 (the genuinely broken records;
@@ -297,9 +305,10 @@ def fetch_tail(stored_extension: int, new_extension: int, token: str,
                max_calls: int = 20) -> tuple[list, int, int]:
     """Fetch the bond-100 records added since `stored_extension`. New achievers have
     the newest rankUpdateTime, so they sit at the TAIL (positions stored+1..new). We
-    re-fetch from the page holding stored+1 (the overlap with known records dedups by
-    key) through the page holding `new`, recovering any poisoned tail page. Returns
-    (records, calls, lost); the caller merges records into the store by key."""
+    re-fetch from the page holding stored+1 through the page holding `new`, recovering
+    any poisoned tail page. Returns (records, calls, lost); the caller merges records
+    into the store deduped by rankUpdateTime (`rut`), which survives the refreshes that
+    the overlap region is full of (a refresher keeps its rut but gets a new key)."""
     out: list = []
     seen: set = set()
     lost = calls = 0

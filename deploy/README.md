@@ -104,9 +104,18 @@ global ranking sorted bond-descending. Two jobs work off it:
   `rank_extension` (arona's bond-100 count) that the tail-fetch keys off.
 - **`--tail`** (the scheduled daily job): reads the current count from page 1, and
   if it GREW, fetches only the tail pages holding the new records (newest
-  rankUpdateTime = end of the block) and merges them by player key. ~2-4 calls. A
-  SHRINK (a player dropped out) can't be localized, so it logs and asks you to run
-  `--global`. Needs a prior `--global` to seed the store.
+  rankUpdateTime = end of the block) and merges them into the store deduped by
+  **`rankUpdateTime`** (arona's stable "Recorded Time"). ~2-4 calls. A SHRINK (a
+  player dropped out) can't be localized, so it logs and asks you to run `--global`.
+  Needs a prior `--global` (one that wrote `rut` into the entries) to seed the store.
+
+  Dedup anchor: NOT the record `key`. arona regenerates a player's `key` every time
+  they refresh their data, and the tail's overlap region is exactly the recently-
+  refreshed players, so a key-dedup re-adds every refresher (this shipped once and
+  over-counted the wall by ~30 per run). `rankUpdateTime` is fixed when the entry is
+  first recorded and stays put across refreshes, so it recognizes them. Because the
+  anchor moved, a store seeded by an OLD `--global` (key-only entries) makes the
+  first `--tail` over-count again; always re-seed with the current `--global` first.
 
 The recovery (both paths): arona's `/rank` 500s ("服务器内部错误") on pages holding
 certain broken student records (same ids that 500 per-student, e.g. Rio Armed

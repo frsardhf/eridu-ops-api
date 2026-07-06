@@ -20,9 +20,10 @@ from datetime import datetime, timedelta, timezone
 
 from db import get_connection, init_db
 
-CEILING = 58           # small margin under arona's ~60/day
+CEILING = 80           # arona's ~60/day is soft (200+/day observed with no errors);
+                       # this only bounds a runaway, real usage is far lower
 REFRESH_RESERVE = 10   # always free for user-facing submissions
-SWEEP_LIMIT = CEILING - REFRESH_RESERVE   # 48: covers the global fetch + recovery
+SWEEP_LIMIT = CEILING - REFRESH_RESERVE   # 70: full global fetch (~48) + growth/poison slack
 # Rolling window for the shared cap. MUST be shorter than the daily sweep cadence
 # (24h): with a 24h window, a full ~40-call sweep is still "in window" when the
 # next daily run fires ~24h later, so that run sees 0 budget and fetches nothing

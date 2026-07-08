@@ -192,10 +192,28 @@ def run_global(publish: bool = True, force: bool = False) -> None:
             by_student.setdefault(r["studentId"], []).append(
                 {"serverRegion": r["serverRegion"], "playerName": r["playerName"],
                  "key": r["key"], "rut": r["rut"]})
+        # Preserve fetched_at for students whose roster is unchanged, so per-student
+        # freshness tracks real changes, not the daily rebuild. Compare only the
+        # (server, name) roster: `key`/`rut` are arona-minted and churn on every
+        # refresh, so including them would restamp nearly every student daily.
+        def roster_of(entries: list) -> tuple:
+            return tuple(sorted((e["serverRegion"], e["playerName"]) for e in entries))
+
+        prev_roster: dict[int, tuple[tuple, str]] = {}
+        for r in conn.execute("SELECT student_id, entries, fetched_at FROM bond100_student_rank"):
+            prev_roster[r["student_id"]] = (roster_of(json.loads(r["entries"])), r["fetched_at"])
+
         today = date.today().isoformat()
         conn.execute("DELETE FROM bond100_student_rank")
+        unchanged = 0
         for sid, entries in by_student.items():
-            wall_store.upsert_student(conn, sid, len(entries), entries, "rank", today)
+            old = prev_roster.get(sid)
+            if old and old[0] == roster_of(entries):
+                fetched_at = old[1]   # roster identical: keep the real last-changed date
+                unchanged += 1
+            else:
+                fetched_at = today
+            wall_store.upsert_student(conn, sid, len(entries), entries, "rank", fetched_at)
         # rank_extension = arona's bond-100 count; the tail-fetch reads it to know
         # where the new records start (positions stored_extension+1 .. new).
         conn.execute(
@@ -204,8 +222,8 @@ def run_global(publish: bool = True, force: bool = False) -> None:
         conn.commit()
         print(f"global fetch: {len(records)} bond-100"
               + (f" (+{lost} lost to arona's broken records)" if lost else "")
-              + f" across {len(by_student)} students in {calls} calls; "
-              f"budget now {budget.calls_in_window(conn)}/{budget.CEILING}")
+              + f" across {len(by_student)} students ({unchanged} unchanged, date kept) "
+              f"in {calls} calls; budget now {budget.calls_in_window(conn)}/{budget.CEILING}")
     finally:
         conn.close()
 

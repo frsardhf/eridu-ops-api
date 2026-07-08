@@ -105,6 +105,10 @@ scheduled daily job:
   Rebuilds from arona's ground truth every run, so there is no accumulated drift.
   No `--force` in the unit: it respects our budget gate. `WINDOW_HOURS` (20h) is
   shorter than the daily cadence, so each run starts with a fresh sweep budget.
+  Per-student `fetched_at` is preserved when that student's (server, name) roster
+  is unchanged, so the FE's per-student freshness reflects real roster changes, not
+  the daily rebuild (only students who actually gained/lost/renamed a player restamp
+  to today; `key`/`rut` churn is ignored on purpose).
 
 **Why not an incremental `--tail`?** We tried it and retired it. An append-only
 tail needs a per-record id that's stable across a player refresh, and arona has

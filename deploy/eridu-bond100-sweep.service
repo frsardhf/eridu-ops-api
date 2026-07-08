@@ -1,5 +1,5 @@
 [Unit]
-Description=Eridu Bond 100 daily incremental /rank tail-fetch
+Description=Eridu Bond 100 daily global /rank refresh
 After=network-online.target
 Wants=network-online.target
 
@@ -15,8 +15,11 @@ Environment=BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite
 # ARONA_TOKEN ('<email>:<token>') lives in this file, VPS only, so the token
 # binds to the VPS IP. Leading "-" tolerates the file being absent.
 EnvironmentFile=-/opt/eridu-ops-api/.env
-# Incremental: reads the current bond-100 count and fetches only the newly-added
-# records at the tail (~2-4 calls). Needs a prior `sweep_rank.py --global` to seed
-# the store; re-run --global manually to resync after a removal or once arona fixes
-# a broken record.
-ExecStart=/opt/eridu-ops-api/services/bond100/.venv/bin/python sweep_rank.py --tail
+# Full global refresh: pages the entire bond-100 block and ATOMICALLY replaces the
+# wall (~33-48 calls, under SWEEP_LIMIT). Chosen over the --tail incremental because
+# arona regenerates BOTH `key` and `rankUpdateTime` on every player refresh, so no
+# per-record anchor dedups reliably across time, and an append-only tail can't see
+# removals anyway. --global rebuilds from arona's ground truth each run: no drift,
+# no ghosts, no dupes. WINDOW_HOURS (20h) < this daily cadence, so each run starts
+# with a fresh sweep budget. No --force: it respects OUR budget gate.
+ExecStart=/opt/eridu-ops-api/services/bond100/.venv/bin/python sweep_rank.py --global

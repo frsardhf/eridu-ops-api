@@ -93,29 +93,31 @@ To pause ingestion entirely (e.g. arona warns their data is dirty until a
 cleanup lands): `systemctl disable --now eridu-bond100-sync.timer`; re-enable
 later with `systemctl enable --now eridu-bond100-sync.timer`.
 
-### Daily /rank refresh (global fetch + incremental tail)
+### Daily /rank refresh (global fetch; tail is debug-only)
 
 `friends/rank` queried **without** a `studentId` (server=4) returns the whole
-global ranking sorted bond-descending. Two jobs work off it:
+global ranking sorted bond-descending. The **`--global`** full fetch is the
+scheduled daily job:
 
-- **`--global`** (seed / periodic resync): pages the entire top bond-100 block,
+- **`--global`** (the scheduled daily job): pages the entire top bond-100 block,
   aggregates per student, and **atomically** replaces + publishes the wall.
-  ~`ceil(bond100/50)` pages (~33 at 1600 bond-100) + recovery. It also records
-  `rank_extension` (arona's bond-100 count) that the tail-fetch keys off.
-- **`--tail`** (the scheduled daily job): reads the current count from page 1, and
-  if it GREW, fetches only the tail pages holding the new records (newest
-  rankUpdateTime = end of the block) and merges them into the store deduped by
-  **`rankUpdateTime`** (arona's stable "Recorded Time"). ~2-4 calls. A SHRINK (a
-  player dropped out) can't be localized, so it logs and asks you to run `--global`.
-  Needs a prior `--global` (one that wrote `rut` into the entries) to seed the store.
+  ~`ceil(bond100/50)` pages (~33 at 1600 bond-100) + recovery, under `SWEEP_LIMIT`.
+  Rebuilds from arona's ground truth every run, so there is no accumulated drift.
+  No `--force` in the unit: it respects our budget gate. `WINDOW_HOURS` (20h) is
+  shorter than the daily cadence, so each run starts with a fresh sweep budget.
 
-  Dedup anchor: NOT the record `key`. arona regenerates a player's `key` every time
-  they refresh their data, and the tail's overlap region is exactly the recently-
-  refreshed players, so a key-dedup re-adds every refresher (this shipped once and
-  over-counted the wall by ~30 per run). `rankUpdateTime` is fixed when the entry is
-  first recorded and stays put across refreshes, so it recognizes them. Because the
-  anchor moved, a store seeded by an OLD `--global` (key-only entries) makes the
-  first `--tail` over-count again; always re-seed with the current `--global` first.
+**Why not an incremental `--tail`?** We tried it and retired it. An append-only
+tail needs a per-record id that's stable across a player refresh, and arona has
+none: it regenerates **both** the record `key` AND `rankUpdateTime` on every
+refresh (key changes instantly -> a key-dedup over-counted ~30/run; rut changes
+with jitter -> a rut-dedup drifted slower but still accumulated dupes, e.g. one
+player's rut moved 365ms across a refresh). Separately, a tail can't see
+**removals** (an unregistered player sits mid-list, never re-fetched), and a
+shrink hidden inside a larger growth (`+9 join / -8 leave = +1 net`) never trips
+the shrink guard, so ghosts accumulate. `--global`'s atomic rebuild sidesteps
+both. `--tail` (+ `--tail --dry-run`) is kept only as a manual debug tool; if a
+future probe finds a genuinely stable anchor (e.g. equipment ServerId) it could
+return as an optimization on top of a periodic `--global`.
 
 The recovery (both paths): arona's `/rank` 500s ("服务器内部错误") on pages holding
 certain broken student records (same ids that 500 per-student, e.g. Rio Armed
@@ -126,15 +128,11 @@ genuinely-broken record. It publishes only when everything is accounted for
 
 ```bash
 cd /opt/eridu-ops-api/services/bond100
-# seed / full resync (run once to start, and after a shrink or an arona fix):
+# the scheduled daily job, run manually (atomic full rebuild + publish):
 sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --global'
-# incremental tail (the scheduled job), run manually:
-sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --tail'
-# PREVIEW a tail run without mutating the store (so you don't have to re-seed to
-# re-test): prints "WOULD add +N; served wall X -> X+N" and writes nothing. Still
-# spends the ~2-4 arona calls, since that's how it computes the diff.
-sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --tail --dry-run --force'
 # --force bypasses OUR budget gate (not arona's) for an off-window manual run.
+# DEBUG ONLY (not scheduled): the retired incremental tail + its non-mutating preview.
+sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --tail --dry-run --force'
 # pinpoint the broken record on a poisoned page (~15 calls):
 sudo -u eridu bash -c 'set -a; source /opt/eridu-ops-api/.env; BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite; set +a; .venv/bin/python sweep_rank.py --diagnose-page 16'
 # read-only report (no arona calls); and per-student debug via the old endpoint:

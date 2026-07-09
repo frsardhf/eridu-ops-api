@@ -103,8 +103,12 @@ scheduled daily job:
   aggregates per student, and **atomically** replaces + publishes the wall.
   ~`ceil(bond100/50)` pages (~33 at 1600 bond-100) + recovery, under `SWEEP_LIMIT`.
   Rebuilds from arona's ground truth every run, so there is no accumulated drift.
-  No `--force` in the unit: it respects our budget gate. `WINDOW_HOURS` (20h) is
-  shorter than the daily cadence, so each run starts with a fresh sweep budget.
+  Uses `--force`: the daily rebuild must run, but the shared 20h budget window can be
+  spent by manual `--force` runs or a submission spike beforehand (that zeroed the
+  gate and skipped the Jul 09 run with "sweep budget left was 0", leaving the wall a
+  day stale). arona's ~60/day is soft (200+ observed) and `--global` is only ~48
+  calls, so forcing past our gate is safe; the calls are still logged, so the
+  user-facing `/refresh` path still sees accurate usage.
   Per-student `fetched_at` is preserved when that student's (server, name) roster
   is unchanged, so the FE's per-student freshness reflects real roster changes, not
   the daily rebuild (only students who actually gained/lost/renamed a player restamp

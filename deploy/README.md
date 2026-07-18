@@ -35,7 +35,7 @@ DOMAIN=api.example.com EMAIL=you@example.com bash setup.sh
 
 Two independent services behind one nginx:
 - **Parser** — gunicorn `127.0.0.1:5001`, 3 workers, rate-limited 5 req/min/IP on `/inventory/parse`.
-- **Bond100** — gunicorn `127.0.0.1:5002`, 2 workers. Reads (`/bond100/summary`, `/bond100/students/<id>/entries`) at 2 req/s/IP; the one write (`/bond100/submissions`, which triggers a rate-limited arona `/refresh`) at 10 req/min/IP. A daily `eridu-bond100-sync` timer refreshes the cached wall. No admin/moderation queue (bridge model).
+- **Bond100** — gunicorn `127.0.0.1:5002`, 2 workers. Reads (`/bond100/summary`, `/bond100/players`, `/bond100/students/<id>/entries`) at 2 req/s/IP; the one write (`/bond100/submissions`, which triggers a rate-limited arona `/refresh`) at 10 req/min/IP. A daily `eridu-bond100-sync` timer refreshes the cached wall. No admin/moderation queue (bridge model).
 
 ## Bond 100 Hall (bridge model)
 
@@ -176,8 +176,9 @@ fast one-call baseline for all students); re-enable it then.
 
 Every path that hits arona, `/refresh` submissions, the `/rank` sweep, and the
 `_info` sync, shares arona's ~60/day token via one ledger (`bond100_api_log`).
-`budget.py` holds a `CEILING` of 55 (safety margin) and reserves 15 calls for
-user submissions, so the sweep self-limits to 40 and can never starve "add me".
+`budget.py` holds a `CEILING` of 80 (arona's ~60/day is soft, with 200+/day
+observed and no errors) and reserves `REFRESH_RESERVE` (10) for user submissions,
+so the sweep self-limits to `SWEEP_LIMIT` (70) and can never starve "add me".
 Check current usage:
 
 ```bash
@@ -189,7 +190,7 @@ sudo -u eridu bash -c 'BOND100_DB_PATH=/opt/eridu-ops-api/var/bond100.sqlite pyt
 `POST /bond100/submissions {serverRegion, friendCode}` triggers an arona
 `/refresh` for that account, so it appears in the next sync. It's rate-limited in
 three layers — nginx edge, a per-code 6h cooldown, and the shared daily budget
-above (`/refresh` may use the full 55 ceiling; the ledger counts every call kind)
+above (`/refresh` may use the full 80 ceiling; the ledger counts every call kind)
 — and the friend code is never stored (only a salted hash for the cooldown).
 Removal is handled on arona's side; the frontend links out to arona's guidelines.
 

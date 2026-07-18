@@ -93,6 +93,31 @@ def build_wall(students: list[dict]) -> tuple[dict, dict]:
     return summary, entries_blob
 
 
+def build_players(students: list[dict]) -> list[dict]:
+    """Pure: rows -> the player-centric inversion of the wall (the /players
+    leaderboard). Groups every bond-100 entry by (serverRegion, playerName): one
+    row per player with the students they maxed. studentIds are deduped; arona
+    exposes no stable player id, so same-name players on one server merge, and a
+    merged pair that maxed the same student would otherwise show a duplicate icon
+    (accepted rarity; count is the deduped student count). Sorted by count desc,
+    then server/name for a deterministic order."""
+    by_player: dict[tuple[str, str], set[int]] = {}
+    for s in students:
+        for e in s["entries"]:
+            by_player.setdefault((e["serverRegion"], e["playerName"]), set()).add(s["student_id"])
+    players = [
+        {
+            "playerName": name,
+            "serverRegion": region,
+            "count": len(sids),
+            "studentIds": sorted(sids),
+        }
+        for (region, name), sids in by_player.items()
+    ]
+    players.sort(key=lambda p: (-p["count"], p["serverRegion"], p["playerName"]))
+    return players
+
+
 def _strip_freshness(summary: dict) -> dict:
     """Drop per-student fetchedAt so the data (counts/byServer) can be compared
     against the old _info wall, which predates the freshness field."""
@@ -117,10 +142,11 @@ def _read_blobs(conn) -> tuple[dict | None, dict | None, str | None]:
     return summary, entries, rows.get("snapshot_date")
 
 
-def _write_blobs(conn, summary: dict, entries: dict) -> None:
+def _write_blobs(conn, summary: dict, entries: dict, players: list) -> None:
     for key, value in (
         ("wall_summary", json.dumps(summary, ensure_ascii=False, separators=(",", ":"))),
         ("entries", json.dumps(entries, ensure_ascii=False, separators=(",", ":"))),
+        ("players", json.dumps(players, ensure_ascii=False, separators=(",", ":"))),
     ):
         conn.execute(
             "INSERT INTO bond100_meta (key, value) VALUES (?, ?) "
@@ -130,14 +156,15 @@ def _write_blobs(conn, summary: dict, entries: dict) -> None:
 
 
 def assemble_wall() -> tuple[dict, dict]:
-    """Rebuild the bond100_meta wall blobs from bond100_student_rank. Returns the
-    (summary, entries) written. snapshot_date is left untouched here (the sweep
-    owns freshness via per-student fetched_at)."""
+    """Rebuild the bond100_meta wall blobs (summary, entries, players) from
+    bond100_student_rank. Returns the (summary, entries) written. snapshot_date
+    is left untouched here (the sweep owns freshness via per-student fetched_at)."""
     init_db()
     conn = get_connection()
     try:
-        summary, entries = build_wall(read_all_students(conn))
-        _write_blobs(conn, summary, entries)
+        students = read_all_students(conn)
+        summary, entries = build_wall(students)
+        _write_blobs(conn, summary, entries, build_players(students))
         conn.commit()
     finally:
         conn.close()

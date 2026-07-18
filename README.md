@@ -90,7 +90,7 @@ The cap is **3, not higher**: a gating test showed multi-grid accuracy is 100% a
 | `cache/icons/` + `cache/icon_index_*.json` | SchaleDB sprites + index — never committed to git, fetched on deploy |
 | `deploy/setup.sh` | One-shot VPS installer (idempotent) |
 | `deploy/eridu-parser.service` | Inventory parser systemd unit |
-| `deploy/eridu-bond100.service` | Bond 100 Hall systemd unit (paired with `eridu-bond100-sync.{service,timer}` for the daily refresh) |
+| `deploy/eridu-bond100.service` | Bond 100 Hall systemd unit (paired with `eridu-bond100-sweep.{service,timer}` for the daily `/rank` sweep) |
 | `deploy/eridu-api.nginx.conf` | Nginx reverse proxy + rate limiting config (both services) |
 
 ## Local development
@@ -180,7 +180,7 @@ Rows are global across the batch: screenshot #1 → rows `0..3` (items) / `0..4`
 
 A second service (gunicorn `:5002`, same nginx) backing the `/hall` page on the frontend — a community wall of how many players have reached **Bond 100** with each student, by Global server.
 
-**Bridge model:** arona.icu is the single source of truth. A daily systemd timer runs `sync_arona.py`, which pulls arona's `rank_by_max_favor_user_info` endpoint in one call, aggregates the five Global servers into per-student counts + name lists, and caches them as JSON blobs in a small SQLite cache. The API just serves that cache — no scraping, no merge logic, no per-entry storage.
+**Bridge model:** arona.icu is the single source of truth. A daily systemd timer runs `sweep_rank.py --global`, a rolling sweep of arona's `friends/rank` global ranking that aggregates per student and atomically rebuilds + publishes the wall to a small SQLite cache. The API just serves that cache: no scraping, no merge logic, no per-entry storage. (An older one-call `_info` baseline, `sync_arona.py`, is retired to a manual re-seed.)
 
 | Endpoint | Purpose |
 |---|---|
@@ -190,4 +190,4 @@ A second service (gunicorn `:5002`, same nginx) backing the `/hall` page on the 
 
 Removal is handled on arona's side (the frontend links to arona's guidelines). Friend codes are never stored — only a salted hash, for submission rate-limiting (per-code 6h cooldown + global daily cap). The arona API token (`ARONA_TOKEN`) and the daily sync are covered in [`deploy/README.md`](deploy/README.md).
 
-Key files: `services/bond100/{sync_arona,app,repository,arona_client,db}.py`, `schema.sql`.
+Key files: `services/bond100/{sweep_rank,wall_store,rank_client,budget,sync_arona,app,repository,arona_client,db}.py`, `schema.sql`.

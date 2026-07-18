@@ -10,6 +10,7 @@ handled on arona's side (the frontend shows guidelines), so there's no removal
 endpoint or moderation queue here.
 
     GET  /bond100/summary
+    GET  /bond100/players
     GET  /bond100/students/<id>/entries
     GET  /bond100/health
     POST /bond100/submissions
@@ -50,6 +51,11 @@ MAX_TEXT = 300     # friend code length guard
 @app.get("/bond100/summary")
 def summary():
     return jsonify(repository.get_summary())
+
+
+@app.get("/bond100/players")
+def players():
+    return jsonify(repository.get_players())
 
 
 @app.get("/bond100/students/<int:student_id>/entries")

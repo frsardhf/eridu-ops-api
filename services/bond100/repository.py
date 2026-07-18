@@ -36,6 +36,23 @@ def get_summary() -> dict:
     return result
 
 
+def get_players() -> dict:
+    """{ snapshotDate?, players: [{ playerName, serverRegion, count, studentIds }] }.
+
+    The player-centric inversion of the wall (see wall_store.build_players),
+    sorted count desc. One blob, one read; the frontend filters client-side."""
+    conn = get_connection()
+    try:
+        m = _meta(conn, ("players", "snapshot_date"))
+    finally:
+        conn.close()
+
+    result = {"players": json.loads(m["players"]) if m.get("players") else []}
+    if m.get("snapshot_date"):
+        result["snapshotDate"] = m["snapshot_date"]
+    return result
+
+
 def get_student_entries(student_id: int) -> dict:
     """{ studentId, fetchedAt?, entries: [{ serverRegion, playerName }] }.
 

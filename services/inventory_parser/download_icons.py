@@ -29,8 +29,7 @@ _HEADERS = {
     'Accept': 'application/json, image/webp, */*',
 }
 
-# Mirror of pipeline.py ITEM_INCLUDE_FILTER / EQUIPMENT_INCLUDE_FILTER.
-# Keep these in sync with src/types/resource.ts MATERIAL / EQUIPMENT constants.
+# Keep these in sync with the frontend's MATERIAL / EQUIPMENT constants.
 ITEM_INCLUDE_FILTER = {
     'category':    {'CharacterExpGrowth', 'Favor'},
     'subcategory': {'Artifact', 'CDItem', 'BookItem'},
@@ -39,6 +38,7 @@ ITEM_INCLUDE_FILTER = {
 EQUIPMENT_INCLUDE_FILTER = {
     'category':    {'Exp', 'WeaponExpGrowthA', 'WeaponExpGrowthB', 'WeaponExpGrowthC', 'WeaponExpGrowthZ'},
     'recipecost':  {1500, 10000, 25000, 50000, 75000, 100000, 125000, 150000, 175000},
+    'id':          set(range(501000, 510000, 1000)),
 }
 
 
@@ -85,6 +85,7 @@ def _item_passes_filter(item: dict, inventory_type: str) -> bool:
     return (
         item.get('Category') in f['category']
         or item.get('RecipeCost') in f['recipecost']
+        or item.get('Id') in f['id']
     )
 
 

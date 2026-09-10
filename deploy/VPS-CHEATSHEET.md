@@ -113,7 +113,7 @@ Invariant: **served total == arona badge** (minus 1 per poisoned record) = healt
 
 ```bash
 cd /opt/eridu-ops-api && git pull
-sudo -u eridu bash -c "cd /opt/eridu-ops-api/services/inventory_parser && source .venv/bin/activate && python download_icons.py && python embed.py items && python embed.py equipment"
+sudo -u eridu bash -c "cd /opt/eridu-ops-api/services/inventory_parser && source .venv/bin/activate && python download_icons.py"
 systemctl restart eridu-parser
 ```
 

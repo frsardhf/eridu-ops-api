@@ -1,6 +1,6 @@
 # Bond 100 Hall
 
-Lightweight SQLite-backed Flask service powering the `/hall` page on the frontend — a community wall of how many players have reached **Bond 100** with each student, on the Global servers.
+Lightweight SQLite-backed Flask service powering the `/hall` page. Hall data is a regenerable arona.icu cache.
 
 Runs as its own gunicorn process at `127.0.0.1:5002` (two preloaded workers), behind the same nginx as the inventory parser.
 
@@ -27,7 +27,7 @@ Removal is handled on arona's side; the frontend links out to arona's guidelines
 
 | File | Purpose |
 |---|---|
-| `app.py` | Flask entrypoint: 4 routes, CORS, no warmup |
+| `app.py` | Flask entrypoint: Hall routes, CORS, no warmup |
 | `sweep_rank.py` | **The scheduled daily job** (`--global --force`): rolling `/rank` sweep that pages arona's global bond-100 ranking, aggregates per student, and atomically rebuilds + publishes the wall via `wall_store.py`. Poisoned-page recovery (re-fetch at size 5, drill the bad chunk at size 1) so a partial fetch never regresses the wall. Also `--student` / `--report` / `--diagnose-page`, and a retired `--tail` kept debug-only |
 | `wall_store.py` | Per-student store + wall assembly: writes one student's row (`source` `rank` or `info`), reassembles the summary + entries blob, and `--commit` publishes it. Preserves per-student `fetched_at` when that student's roster is unchanged, so freshness reflects real roster changes, not the daily rebuild |
 | `rank_client.py` | arona `friends/rank` client: fetches one student's live bond-100 entries (the per-student sweep path) |
@@ -55,7 +55,7 @@ cd services/bond100
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# Initialise the SQLite file from schema.sql (creates ./data/bond100.sqlite)
+# Initialise the SQLite cache under ./data/
 python db.py
 
 # _info baseline re-seed without hitting arona (replay a saved JSON dump)

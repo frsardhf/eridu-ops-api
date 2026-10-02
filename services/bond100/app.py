@@ -1,8 +1,7 @@
-"""Bond 100 Hall API — lightweight SQLite-backed Flask service.
+"""Bond 100 Hall API, backed by SQLite.
 
 Runs as its own process (port 5002) separate from the inventory_parser, behind
-the same nginx. Route paths include the /bond100 prefix; nginx proxies the
-prefix through without stripping.
+the shared nginx. Nginx proxies the route prefix through without stripping.
 
 Bridge model: arona.icu is the single source. sync_arona.py caches the wall, and
 these endpoints serve it. Submissions trigger an arona /refresh; removal is
@@ -22,8 +21,7 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-# Submission outcomes (incl. arona /refresh failure reasons) log through the
-# "bond100" logger; INFO+ to stderr so journald captures it under the service.
+# Hall refresh outcomes at INFO+ go to stderr so journald captures them.
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s %(message)s",
@@ -43,7 +41,7 @@ CORS(app, origins=["https://eriduops.com", "http://localhost:5173"])
 
 init_db()
 
-MAX_TEXT = 300     # friend code length guard
+MAX_FRIEND_CODE_LENGTH = 300
 
 
 # ── Public reads ─────────────────────────────────────────────────────────────
@@ -79,7 +77,7 @@ def create_submission():
     if d.get("serverRegion") not in SERVER_REGIONS:
         return jsonify({"error": "invalid serverRegion"}), 400
     fc = d.get("friendCode")
-    if not isinstance(fc, str) or not fc.strip() or len(fc) > MAX_TEXT:
+    if not isinstance(fc, str) or not fc.strip() or len(fc) > MAX_FRIEND_CODE_LENGTH:
         return jsonify({"error": "friendCode required"}), 400
 
     result, status = arona_client.submit_refresh(d["serverRegion"], fc)

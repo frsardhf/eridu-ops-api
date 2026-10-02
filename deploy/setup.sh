@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-shot installer for the inventory parser API.
+# One-shot installer for the Eridu Ops API services.
 # Run on a fresh Ubuntu 24.04 VPS as root:
 #
 #   curl -fsSL https://raw.githubusercontent.com/frsardhf/eridu-ops-api/master/deploy/setup.sh | bash
@@ -16,7 +16,8 @@ EMAIL="${EMAIL:-frsardhafa@gmail.com}"
 APP_DIR="/opt/eridu-ops-api"
 SVC_DIR="$APP_DIR/services/inventory_parser"
 SVC_BOND_DIR="$APP_DIR/services/bond100"
-VAR_DIR="$APP_DIR/var"   # stateful data (bond100 SQLite) — outside the code tree
+SVC_FEEDBACK_DIR="$APP_DIR/services/feedback"
+VAR_DIR="$APP_DIR/var"   # SQLite state outside the code tree
 REPO_URL="https://github.com/frsardhf/eridu-ops-api.git"
 USER_NAME="eridu"
 
@@ -27,7 +28,7 @@ fi
 
 echo "==> System packages"
 apt update
-apt install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx git ufw curl libgl1
+apt install -y python3 python3-venv python3-pip nginx certbot python3-certbot-nginx git ufw curl libgl1 sqlite3
 
 echo "==> Service user"
 id "$USER_NAME" &>/dev/null || useradd -m -s /bin/bash "$USER_NAME"
@@ -61,14 +62,30 @@ sudo -u "$USER_NAME" bash -c "
   pip install -r requirements.txt
 "
 
-echo "==> Bond100 cache dir (persists across git pull)"
+echo "==> Python venv + deps (feedback)"
+sudo -u "$USER_NAME" bash -c "
+  set -e
+  cd '$SVC_FEEDBACK_DIR'
+  python3 -m venv .venv
+  source .venv/bin/activate
+  pip install --upgrade pip
+  pip install -r requirements.txt
+"
+
+echo "==> SQLite state dir (persists across git pull)"
 install -d -o "$USER_NAME" -g "$USER_NAME" "$VAR_DIR"
-# Initialize the cache tables. The wall is populated by sync_arona.py once
-# ARONA_TOKEN is set in /opt/eridu-ops-api/.env — see deploy/README.md.
+# Initialize the Hall cache. The wall is populated once ARONA_TOKEN is set in
+# /opt/eridu-ops-api/.env; see deploy/README.md.
 sudo -u "$USER_NAME" bash -c "
   set -e
   cd '$SVC_BOND_DIR'
   BOND100_DB_PATH='$VAR_DIR/bond100.sqlite' .venv/bin/python db.py
+"
+# Feedback owns a separate durable database.
+sudo -u "$USER_NAME" bash -c "
+  set -e
+  cd '$SVC_FEEDBACK_DIR'
+  FEEDBACK_DB_PATH='$VAR_DIR/feedback.sqlite' .venv/bin/python db.py
 "
 
 echo "==> Download icons + build icon index (fetches from schaledb.com)"
@@ -91,6 +108,7 @@ systemctl reload nginx
 echo "==> Systemd services"
 install -m 644 "$APP_DIR/deploy/eridu-parser.service" /etc/systemd/system/eridu-parser.service
 install -m 644 "$APP_DIR/deploy/eridu-bond100.service" /etc/systemd/system/eridu-bond100.service
+install -m 644 "$APP_DIR/deploy/eridu-feedback.service" /etc/systemd/system/eridu-feedback.service
 # _info baseline sync (one arona call for all students; frozen/delayed cache).
 install -m 644 "$APP_DIR/deploy/eridu-bond100-sync.service" /etc/systemd/system/eridu-bond100-sync.service
 install -m 644 "$APP_DIR/deploy/eridu-bond100-sync.timer" /etc/systemd/system/eridu-bond100-sync.timer
@@ -100,6 +118,7 @@ install -m 644 "$APP_DIR/deploy/eridu-bond100-sweep.timer" /etc/systemd/system/e
 systemctl daemon-reload
 systemctl enable --now eridu-parser
 systemctl enable --now eridu-bond100
+systemctl enable --now eridu-feedback
 # The sweep owns the wall; enable its timer. The _info sync is the superseded
 # baseline (frozen upstream), so its timer stays OFF — re-enable only if arona
 # fixes _info. Both unit files are installed either way.
@@ -124,9 +143,10 @@ echo "==> SSL (certbot)"
 certbot --nginx -d "$DOMAIN" --non-interactive --agree-tos -m "$EMAIL" --redirect
 
 echo "==> Done. Service status:"
-systemctl status eridu-parser --no-pager -l | head -20
+systemctl status eridu-parser eridu-bond100 eridu-feedback --no-pager -l | head -60
 
 echo
 echo "Test from your local machine:"
 echo "  curl -X POST https://$DOMAIN/inventory/parse \\"
 echo "    -F image=@screenshot.png -F inventoryType=items"
+echo "  curl https://$DOMAIN/feedback/health"

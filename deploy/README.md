@@ -1,6 +1,6 @@
 # Deployment
 
-One-shot installer for the inventory parser API on a fresh Ubuntu 24.04 VPS.
+One-shot installer for the Eridu Ops API services on a fresh Ubuntu 24.04 VPS.
 
 ## Quick start
 
@@ -29,13 +29,16 @@ DOMAIN=api.example.com EMAIL=you@example.com bash setup.sh
 | Systemd unit | `/etc/systemd/system/eridu-parser.service` |
 | Bond100 venv | `/opt/eridu-ops-api/services/bond100/.venv` |
 | Bond100 cache | `/opt/eridu-ops-api/var/bond100.sqlite` (regenerable cache — survives `git pull`) |
-| Systemd units | `eridu-parser.service`, `eridu-bond100.service`, `eridu-bond100-sync.{service,timer}`, `eridu-bond100-sweep.{service,timer}` |
+| Feedback venv | `/opt/eridu-ops-api/services/feedback/.venv` |
+| Feedback database | `/opt/eridu-ops-api/var/feedback.sqlite` (durable primary data; survives `git pull`) |
+| Systemd units | `eridu-parser.service`, `eridu-bond100.service`, `eridu-feedback.service`, `eridu-bond100-sync.{service,timer}`, `eridu-bond100-sweep.{service,timer}` |
 | Nginx site | `/etc/nginx/sites-available/eridu-api` |
 | SSL cert | `/etc/letsencrypt/live/<DOMAIN>/` (auto-renews via certbot timer) |
 
-Two independent services behind one nginx:
+Three independent services behind one nginx:
 - **Parser** — gunicorn `127.0.0.1:5001`, 3 workers, rate-limited 5 req/min/IP on `/inventory/parse`.
-- **Bond100** — gunicorn `127.0.0.1:5002`, 2 workers. Reads (`/bond100/summary`, `/bond100/players`, `/bond100/students/<id>/entries`) at 2 req/s/IP; the one write (`/bond100/submissions`, which triggers a rate-limited arona `/refresh`) at 10 req/min/IP. A daily `eridu-bond100-sync` timer refreshes the cached wall. No admin/moderation queue (bridge model).
+- **Bond100** — gunicorn `127.0.0.1:5002`, 2 workers. Hall reads are limited to 2 req/s/IP. Hall submissions trigger a rate-limited arona `/refresh`.
+- **Feedback** — gunicorn `127.0.0.1:5003`, 1 worker. Anonymous submissions accept a burst of 3 per IP, then replenish at 1/minute, and write to a dedicated durable database. Feedback has no public read route.
 
 ## Bond 100 Hall (bridge model)
 
@@ -194,13 +197,58 @@ above (`/refresh` may use the full 80 ceiling; the ledger counts every call kind
 — and the friend code is never stored (only a salted hash for the cooldown).
 Removal is handled on arona's side; the frontend links out to arona's guidelines.
 
+## Anonymous feedback
+
+`POST /feedback/submissions` accepts a category, message, page, locale, and a
+hidden honeypot field. Nginx caps request bodies at 16 KB and rate-limits the
+route. The independent Flask service validates a 2,000-character message limit
+and stores no contact information or raw IP address.
+
+Review it from the VPS, with no public admin endpoint:
+
+```bash
+cd /opt/eridu-ops-api/services/feedback
+sudo -u eridu bash -c 'FEEDBACK_DB_PATH=/opt/eridu-ops-api/var/feedback.sqlite .venv/bin/python cli.py list'
+sudo -u eridu bash -c 'FEEDBACK_DB_PATH=/opt/eridu-ops-api/var/feedback.sqlite .venv/bin/python cli.py status 12 reviewed'
+```
+
+#### Existing VPS one-time activation
+
+This release adds a virtual environment and systemd unit and changes the nginx
+site, so a normal `git pull` and service restart is not enough for the first
+deployment:
+
+```bash
+cd /opt/eridu-ops-api
+git pull
+chown -R eridu:eridu /opt/eridu-ops-api
+
+sudo -u eridu bash -c 'cd /opt/eridu-ops-api/services/feedback && python3 -m venv .venv && source .venv/bin/activate && pip install --upgrade pip && pip install -r requirements.txt'
+sudo -u eridu bash -c 'cd /opt/eridu-ops-api/services/feedback && FEEDBACK_DB_PATH=/opt/eridu-ops-api/var/feedback.sqlite .venv/bin/python db.py'
+
+install -m 644 deploy/eridu-feedback.service /etc/systemd/system/eridu-feedback.service
+systemctl daemon-reload
+systemctl enable --now eridu-feedback
+
+install -m 644 deploy/eridu-api.nginx.conf /etc/nginx/sites-available/eridu-api
+sed -i 's/__DOMAIN__/api.eriduops.com/g' /etc/nginx/sites-available/eridu-api
+certbot --nginx -d api.eriduops.com --non-interactive --agree-tos -m frsardhafa@gmail.com --redirect
+nginx -t
+systemctl reload nginx
+curl https://api.eriduops.com/feedback/health
+```
+
+Re-running Certbot matters because installing the repository nginx template
+replaces the live file that already contains Certbot's HTTPS block.
+
 ### Backup
 
-The cache is regenerable, so backups are optional — `systemctl start
-eridu-bond100-sync.service` rebuilds it from arona. To snapshot anyway (WAL-safe):
+The Hall cache is regenerable, so its backup is optional. Feedback is not
+regenerable and should be backed up. Both commands are WAL-safe:
 
 ```bash
 sqlite3 /opt/eridu-ops-api/var/bond100.sqlite ".backup '/root/bond100-$(date +%F).sqlite'"
+sqlite3 /opt/eridu-ops-api/var/feedback.sqlite ".backup '/root/feedback-$(date +%F).sqlite'"
 ```
 
 ## Update flow (after pushing new code)
@@ -209,7 +257,7 @@ sqlite3 /opt/eridu-ops-api/var/bond100.sqlite ".backup '/root/bond100-$(date +%F
 ssh root@<vps-ip>
 cd /opt/eridu-ops-api && git pull
 chown -R eridu:eridu /opt/eridu-ops-api          # git pull as root leaves new files root-owned
-systemctl restart eridu-parser eridu-bond100     # bond100 cache in var/ is untouched
+systemctl restart eridu-parser eridu-bond100 eridu-feedback
 ```
 
 The `chown` matters: a root-run `git pull` makes new files root-owned, which
@@ -242,6 +290,13 @@ sudo -u eridu bash -c "cd /opt/eridu-ops-api/services/bond100 && source .venv/bi
 systemctl restart eridu-bond100
 ```
 
+If the feedback service's `requirements.txt` changed (separate venv):
+
+```bash
+sudo -u eridu bash -c "cd /opt/eridu-ops-api/services/feedback && source .venv/bin/activate && pip install -r requirements.txt"
+systemctl restart eridu-feedback
+```
+
 If new game items were added (re-fetch icon sprites — the matcher reads them directly, no rebuild step):
 
 ```bash
@@ -261,6 +316,7 @@ sudo -u eridu rm -rf ~eridu/.cache/huggingface
 ```bash
 journalctl -u eridu-parser -f          # live (parser)
 journalctl -u eridu-bond100 -f         # live (bond100)
+journalctl -u eridu-feedback -f        # live (feedback)
 journalctl -u eridu-parser -n 100      # last 100 lines
 ```
 
@@ -268,6 +324,8 @@ journalctl -u eridu-parser -n 100      # last 100 lines
 
 ```bash
 systemctl status eridu-parser
+systemctl status eridu-bond100 eridu-feedback
+curl https://api.eriduops.com/feedback/health
 curl -X POST https://api.eriduops.com/inventory/parse \
   -F image=@screenshot.png -F inventoryType=items
 free -h    # confirm RAM headroom
@@ -275,15 +333,15 @@ free -h    # confirm RAM headroom
 
 ## Migration to a different VPS provider
 
-Both services are now effectively stateless — the parser holds no data and the
-**bond100 DB is a regenerable cache** — so there's nothing to carry over. Just
-re-sync on the new box.
+The parser is stateless and the Bond100 database is regenerable. The feedback
+database is durable and must be copied to the new VPS.
 
-1. Provision new VPS, get IP
-2. Run setup.sh on new VPS
-3. Add `ARONA_TOKEN` to `/opt/eridu-ops-api/.env`, then seed:
+1. Back up `/opt/eridu-ops-api/var/feedback.sqlite` with the command above and copy the backup off the old VPS.
+2. Provision the new VPS and run `setup.sh`.
+3. Stop `eridu-feedback`, replace the newly-created empty `var/feedback.sqlite` with the backup, set ownership to `eridu:eridu`, then restart the service.
+4. Add `ARONA_TOKEN` to `/opt/eridu-ops-api/.env`, then seed:
    `systemctl start eridu-bond100-sync.service` (the first call binds the token
    to the new IP). If the token is locked to the old IP, ask arona to rebind it.
-4. Update Cloudflare A record to new IP (TTL 5 min → traffic switches in ~5 min)
-5. Confirm new VPS is serving (check logs, hit endpoints)
-6. Cancel old VPS subscription
+5. Update the Cloudflare A record to the new IP.
+6. Confirm the API and feedback review CLI work on the new VPS.
+7. Cancel the old VPS subscription only after the feedback backup is verified.

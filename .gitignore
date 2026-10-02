@@ -23,6 +23,9 @@ services/inventory_parser/cache/icons/
 # Bond100 SQLite database (runtime data, not source)
 services/bond100/data/
 
+# Feedback SQLite database (runtime data, not source)
+services/feedback/data/
+
 # Debug output
 services/inventory_parser/assets/debug_out/
 

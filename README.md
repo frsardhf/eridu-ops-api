@@ -1,6 +1,6 @@
 # eridu-ops-api
 
-The backend for [eridu-ops](https://eriduops.com) at `api.eriduops.com` — two services behind one nginx: an **Inventory Scanner** that reads **Blue Archive** inventory screenshots into structured JSON of items + quantities, and the **Bond 100 Hall** (community bond-100 counts, sourced from arona.icu). Most of this README covers the scanner; the Hall is summarized at the [end](#bond-100-hall).
+The backend for [eridu-ops](https://eriduops.com) at `api.eriduops.com` — three services behind one nginx: an **Inventory Scanner** that reads **Blue Archive** inventory screenshots into structured JSON, the **Bond 100 Hall**, and anonymous product feedback. Most of this README covers the scanner; the Hall is summarized at the [end](#bond-100-hall).
 
 ## What it does
 
@@ -142,7 +142,7 @@ Update after a code push (see [`deploy/README.md`](deploy/README.md) for the ful
 ssh root@<vps-ip>
 cd /opt/eridu-ops-api && git pull
 chown -R eridu:eridu /opt/eridu-ops-api          # git pull as root leaves new files root-owned
-systemctl restart eridu-parser eridu-bond100     # bond100 SQLite cache in var/ is untouched
+systemctl restart eridu-parser eridu-bond100 eridu-feedback
 ```
 
 ## API reference
@@ -190,4 +190,14 @@ A second service (gunicorn `:5002`, same nginx) backing the `/hall` page on the 
 
 Removal is handled on arona's side (the frontend links to arona's guidelines). Friend codes are never stored — only a salted hash, for submission rate-limiting (per-code 6h cooldown + global daily cap). The arona API token (`ARONA_TOKEN`) and the daily sync are covered in [`deploy/README.md`](deploy/README.md).
 
-Key files: `services/bond100/{sweep_rank,wall_store,rank_client,budget,sync_arona,app,repository,arona_client,db}.py`, `schema.sql`.
+Key Hall files: `services/bond100/{sweep_rank,wall_store,rank_client,budget,sync_arona,app,repository,arona_client,db}.py` and `schema.sql`.
+
+## Anonymous feedback
+
+An independent one-worker Flask service on port 5003 accepts
+`POST /feedback/submissions` with a category, message, page, and locale. It has
+no public read endpoint; review submissions with `services/feedback/cli.py`.
+
+Feedback lives in its own durable `feedback.sqlite` database and must be backed
+up, unlike the regenerable Hall cache. Implementation and operating instructions
+live in [`services/feedback`](services/feedback/README.md).

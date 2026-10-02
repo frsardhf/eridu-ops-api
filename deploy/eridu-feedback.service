@@ -1,0 +1,20 @@
+[Unit]
+Description=Eridu Anonymous Feedback API
+After=network.target
+
+[Service]
+Type=simple
+User=eridu
+Group=eridu
+WorkingDirectory=/opt/eridu-ops-api/services/feedback
+Environment=PATH=/opt/eridu-ops-api/services/feedback/.venv/bin
+Environment=PYTHONUNBUFFERED=1
+Environment=FEEDBACK_DB_PATH=/opt/eridu-ops-api/var/feedback.sqlite
+ExecStart=/opt/eridu-ops-api/services/feedback/.venv/bin/gunicorn \
+    --config /opt/eridu-ops-api/services/feedback/gunicorn.conf.py \
+    app:app
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
